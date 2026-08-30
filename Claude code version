@@ -1,0 +1,57 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# --- 1. Fetch 2 years of daily OHLCV data for an NYSE stock ---
+ticker = "KO"  # Coca-Cola, NYSE-listed. Try "IBM" or "DIS" too.
+data = yf.download(ticker, period="2y", interval="1d", auto_adjust=True)
+data = data[["Close"]].copy()
+
+# --- 2. Calculate the 20-day and 50-day Simple Moving Averages ---
+data["SMA20"] = data["Close"].rolling(window=20).mean()
+data["SMA50"] = data["Close"].rolling(window=50).mean()
+
+# --- 3. Generate trading signal: 1 = hold long position, 0 = hold cash ---
+# We're "in the market" whenever the fast SMA is above the slow SMA
+data["Signal"] = np.where(data["SMA20"] > data["SMA50"], 1, 0)
+
+# Shift signal by 1 day so we trade on tomorrow's return using today's signal
+# (avoids lookahead bias — you can't act on today's close until tomorrow)
+data["Position"] = data["Signal"].shift(1)
+
+# --- 4. Calculate daily returns for Buy & Hold vs. the Strategy ---
+data["MarketReturn"] = data["Close"].pct_change()
+data["StrategyReturn"] = data["MarketReturn"] * data["Position"]
+
+# --- 5. Build cumulative return curves ---
+data["CumMarket"] = (1 + data["MarketReturn"]).cumprod()
+data["CumStrategy"] = (1 + data["StrategyReturn"]).cumprod()
+data.dropna(inplace=True)
+
+# --- 6. Performance metrics ---
+total_return_strategy = data["CumStrategy"].iloc[-1] - 1
+total_return_market = data["CumMarket"].iloc[-1] - 1
+
+# Sharpe Ratio: annualized, assuming 0% risk-free rate, 252 trading days/year
+sharpe_strategy = (data["StrategyReturn"].mean() / data["StrategyReturn"].std()) * np.sqrt(252)
+
+# Max Drawdown: largest peak-to-trough decline in the strategy's equity curve
+rolling_max = data["CumStrategy"].cummax()
+drawdown = (data["CumStrategy"] - rolling_max) / rolling_max
+max_drawdown = drawdown.min()
+
+# --- 7. Print summary ---
+print(f"--- {ticker} SMA(20/50) Crossover Backtest ---")
+print(f"Strategy Total Return: {total_return_strategy:.2%}")
+print(f"Buy & Hold Total Return: {total_return_market:.2%}")
+print(f"Strategy Sharpe Ratio: {sharpe_strategy:.2f}")
+print(f"Strategy Max Drawdown: {max_drawdown:.2%}")
+
+# --- 8. Plot equity curves for visual comparison ---
+plt.figure(figsize=(10, 5))
+plt.plot(data["CumStrategy"], label="Strategy")
+plt.plot(data["CumMarket"], label="Buy & Hold")
+plt.title(f"{ticker}: Strategy vs Buy & Hold")
+plt.legend()
+plt.show()
