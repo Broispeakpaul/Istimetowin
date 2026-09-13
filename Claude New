@@ -1,0 +1,188 @@
+"""
+EMA + Momentum Trend Strategy with Elliott-Wave Timing Filter,
+Bull Call Spread Structuring, and Beta-Targeted Hedge Overlay
+================================================================
+
+This is a STRATEGY SKELETON, not a finished backtest. Plug in your
+own OHLC price data, benchmark series, and a backtesting engine
+(e.g. backtrader, vectorbt, zipline-reloaded) to run it end to end.
+
+Design targets (validate empirically, not guaranteed by construction):
+  - Annualized alpha:  3.5% - 15%
+  - Portfolio beta:    1.2 - 1.5
+
+This is not financial advice. Historical or simulated performance
+does not guarantee future results.
+"""
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------------------------
+# 1. TREND FILTER: Dual EMA crossover
+# ---------------------------------------------------------------
+def add_ema_signals(df, fast=12, slow=26, price_col="close"):
+    """Standard MACD-family EMA pair. ema_trend = 1 (up) / -1 (down)."""
+    df = df.copy()
+    df["ema_fast"] = df[price_col].ewm(span=fast, adjust=False).mean()
+    df["ema_slow"] = df[price_col].ewm(span=slow, adjust=False).mean()
+    df["ema_trend"] = np.where(df["ema_fast"] > df["ema_slow"], 1, -1)
+    return df
+
+
+# ---------------------------------------------------------------
+# 2. MOMENTUM FILTER: Rate of change
+# ---------------------------------------------------------------
+def add_momentum(df, lookback=63, price_col="close", threshold=0.0):
+    """lookback=63 trading days ~ 1 quarter. Adjust to your horizon."""
+    df = df.copy()
+    df["roc"] = df[price_col].pct_change(lookback)
+    df["momentum_signal"] = np.where(
+        df["roc"] > threshold, 1,
+        np.where(df["roc"] < -threshold, -1, 0)
+    )
+    return df
+
+
+# ---------------------------------------------------------------
+# 3. ELLIOTT WAVE PROXY: swing (zigzag) detector
+#    True Elliott Wave counting is subjective and not mechanically
+#    verifiable. This proxy flags legs that are LARGER than the
+#    swing before them as "impulsive" (a rough stand-in for a
+#    wave-3-style move), so momentum trades are only taken outside
+#    of shallow corrective chop. Treat this as a heuristic filter,
+#    not a literal wave count.
+# ---------------------------------------------------------------
+def zigzag_swings(df, price_col="close", pct_threshold=0.05):
+    prices = df[price_col].values
+    swings = [0]
+    direction = 0
+    last_extreme_idx = 0
+    for i in range(1, len(prices)):
+        change = (prices[i] - prices[last_extreme_idx]) / prices[last_extreme_idx]
+        if direction >= 0 and change <= -pct_threshold:
+            swings.append(last_extreme_idx)
+            direction = -1
+            last_extreme_idx = i
+        elif direction <= 0 and change >= pct_threshold:
+            swings.append(last_extreme_idx)
+            direction = 1
+            last_extreme_idx = i
+        elif (direction >= 0 and prices[i] > prices[last_extreme_idx]) or \
+             (direction <= 0 and prices[i] < prices[last_extreme_idx]):
+            last_extreme_idx = i
+    swings.append(last_extreme_idx)
+    return sorted(set(swings))
+
+
+def add_wave_filter(df, price_col="close", pct_threshold=0.05):
+    df = df.copy()
+    idxs = zigzag_swings(df, price_col, pct_threshold)
+    df["swing_point"] = False
+    df.loc[df.index[idxs], "swing_point"] = True
+
+    swing_prices = df[price_col].values[idxs]
+    swing_sizes = np.abs(np.diff(swing_prices))
+    impulsive = np.zeros(len(df), dtype=bool)
+    for i in range(2, len(swing_sizes)):
+        if swing_sizes[i] > swing_sizes[i - 1]:
+            start, end = idxs[i], idxs[i + 1]
+            impulsive[start:end] = True
+    df["impulsive_wave"] = impulsive
+    return df
+
+
+# ---------------------------------------------------------------
+# 4. COMBINED ENTRY SIGNAL
+# ---------------------------------------------------------------
+def build_signal(df):
+    df = add_ema_signals(df)
+    df = add_momentum(df)
+    df = add_wave_filter(df)
+    df["long_signal"] = (
+        (df["ema_trend"] == 1) &
+        (df["momentum_signal"] == 1) &
+        (df["impulsive_wave"])
+    )
+    df["short_signal"] = (
+        (df["ema_trend"] == -1) &
+        (df["momentum_signal"] == -1) &
+        (df["impulsive_wave"])
+    )
+    return df
+
+
+# ---------------------------------------------------------------
+# 5. TRADE STRUCTURE: Bull call spread payoff
+#    On a long_signal, structure exposure as a bull call spread
+#    (long a near-the-money call, short a higher-strike call)
+#    instead of buying the underlying outright. This caps both
+#    cost and downside, and its embedded leverage helps push net
+#    portfolio beta toward the 1.2-1.5 target without adding an
+#    outright short hedge. Needs a real options chain / IV surface
+#    to backtest properly; wire your data into the two functions
+#    below.
+# ---------------------------------------------------------------
+def bull_call_spread_payoff(spot_at_expiry, long_strike, short_strike,
+                             long_premium, short_premium):
+    long_leg = max(spot_at_expiry - long_strike, 0) - long_premium
+    short_leg = short_premium - max(spot_at_expiry - short_strike, 0)
+    return long_leg + short_leg
+
+
+def bull_call_spread_cost(long_premium, short_premium):
+    """Net debit paid to enter the spread (max loss on the trade)."""
+    return long_premium - short_premium
+
+
+# ---------------------------------------------------------------
+# 6. BETA-TARGETED HEDGE OVERLAY
+#    Compute rolling beta vs. a benchmark and size an index
+#    hedge/leverage overlay to keep net beta inside [1.2, 1.5].
+# ---------------------------------------------------------------
+def rolling_beta(strategy_returns, benchmark_returns, window=126):
+    cov = strategy_returns.rolling(window).cov(benchmark_returns)
+    var = benchmark_returns.rolling(window).var()
+    return cov / var
+
+
+def hedge_ratio_for_target_beta(current_beta, target_beta=1.35):
+    """
+    Positive result: add benchmark exposure (e.g. long index futures)
+    to raise beta toward the target.
+    Negative result: short benchmark exposure to pull beta back down
+    if the options/momentum book has pushed beta above 1.5.
+    """
+    return target_beta - current_beta
+
+
+# ---------------------------------------------------------------
+# 7. ALPHA MEASUREMENT (Jensen's alpha, annualized)
+# ---------------------------------------------------------------
+def jensens_alpha(strategy_returns, benchmark_returns, rf=0.0, periods_per_year=252):
+    beta = rolling_beta(strategy_returns, benchmark_returns).iloc[-1]
+    strat_ann = strategy_returns.mean() * periods_per_year
+    bench_ann = benchmark_returns.mean() * periods_per_year
+    alpha = strat_ann - (rf + beta * (bench_ann - rf))
+    return alpha, beta
+
+
+if __name__ == "__main__":
+    # --- Wire in your own data here ---
+    # df = pd.read_csv("your_ohlc.csv", parse_dates=["date"], index_col="date")
+    # benchmark = pd.read_csv("benchmark.csv", parse_dates=["date"], index_col="date")
+    #
+    # signals = build_signal(df)
+    #
+    # Feed `signals` (long_signal / short_signal columns) into your
+    # backtesting engine to:
+    #   1. Size each entry as a bull call spread (function 5) rather
+    #      than the raw underlying.
+    #   2. Track realized strategy returns vs. the benchmark.
+    #   3. Apply the hedge overlay (function 6) whenever rolling_beta
+    #      drifts outside [1.2, 1.5].
+    #   4. Report jensens_alpha (function 7) net of transaction costs
+    #      and option spread costs to see whether the 3.5%-15% alpha
+    #      target actually holds out of sample.
+    pass
