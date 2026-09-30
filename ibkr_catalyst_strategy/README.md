@@ -2,7 +2,7 @@
 
 A long-only, concentrated strategy for small/mid caps, built for a 3-month competition. It connects to TWS or IB Gateway through the IB API (`ib_async`), and each run does the following:
 
-1. It scans IB for liquid $300M–$10B stocks and ranks them by 3–6 month relative strength.
+1. It scans IB for liquid $300M–$20B stocks and ranks them by 3–6 month relative strength.
 2. It combines those ranks with **your catalyst list** (earnings beats, 13D activists, cash deals, spin-offs and buybacks).
 3. It checks the SPY 200-day regime filter and which competition week you are in.
 4. It shows a dashboard of positions, ranked candidates and proposed orders.
