@@ -2,39 +2,43 @@
 strategy("Five-Filter Long Strategy", shorttitle="5F Long", overlay=true,
      pyramiding=0, process_orders_on_close=true, calc_on_every_tick=false,
      default_qty_type=strategy.percent_of_equity, default_qty_value=100,
-     initial_capital=100000, max_labels_count=500)
+     initial_capital=100000, max_labels_count=500, max_boxes_count=100)
 
 // =====================================================================
-//  Long-only strategy. A long entry fires on a CONFIRMED bar close only
-//  when ALL five filters pass on that bar:
-//    1) Volatility   2) Liquidity / volume   3) Momentum
+//  Long-only strategy, built for a 30-MINUTE chart. A long entry fires on
+//  a CONFIRMED bar close only when ALL five filters pass on that bar:
+//    1) Volatility   2) Liquidity (daily volume)   3) Momentum
 //    4) Support downside   5) Risk-to-reward
-//  Every threshold below is an input. The bracketed values you left in the
-//  brief were filled with the examples you gave ("ex: ..."); change them in
-//  Settings > Inputs.
+//  Chart extras: support/resistance zones, a linear-regression trend line
+//  with a confidence band, and a pass/fail table.
+//  Daily figures (average daily volume, daily ATR) come from ONE
+//  request.security() call on completed daily bars ([1] + lookahead_on =
+//  yesterday's final values), so nothing from an unfinished day leaks back.
 // =====================================================================
 
 // ---------------------------- INPUTS ---------------------------------
 // 1) Volatility
 grpVol    = "1 | Volatility"
-volMode   = input.string("ATR % of close", "Volatility measure", options=["ATR % of close", "Bollinger width %"], group=grpVol, tooltip="ATR % = ATR(length) / close * 100. Bollinger width % = (upper - lower) / basis * 100. The ATR length is also used by the ATR stop.")
-volLen    = input.int(14, "Volatility length (ATR / BB)", minval=2, group=grpVol)
+volMode   = input.string("Daily ATR % (prev day)", "Volatility measure", options=["Daily ATR % (prev day)", "Chart ATR % of close", "Bollinger width %"], group=grpVol, tooltip="Daily ATR % = yesterday's daily ATR / close * 100 (best on a 30m chart). Chart ATR % = ATR of the chart bars / close * 100. Bollinger width % = (upper - lower) / basis * 100 on chart bars.")
+volLen    = input.int(14, "Volatility length (ATR / BB)", minval=2, group=grpVol, tooltip="Also the length of the chart ATR used by the ATR stop and the zone height.")
 bbMult    = input.float(2.0, "Bollinger multiplier", minval=0.1, step=0.1, group=grpVol)
 volMin    = input.float(2.0, "Min volatility (%)", minval=0.0, step=0.1, group=grpVol)
 
-// 2) Liquidity / volume
-grpLiq    = "2 | Liquidity / volume"
-volAvgLen = input.int(20, "Average volume length", minval=2, group=grpLiq)
-minAvgVol = input.float(1000000, "Min average volume (shares)", minval=0, step=100000, group=grpLiq)
+// 2) Liquidity (daily volume)
+grpLiq    = "2 | Liquidity (daily volume)"
+advLen    = input.int(20, "Average daily volume length (days)", minval=2, group=grpLiq)
+minAdv    = input.float(1000000, "Min average daily volume (shares)", minval=0, step=100000, group=grpLiq)
+rvolMin   = input.float(1.0, "Min relative volume (x normal)", minval=0.0, step=0.1, group=grpLiq, tooltip="Today's volume so far divided by the average volume traded by the same time of day over the last N days. Must be ABOVE this (1.0 = today is running heavier than a normal day).")
 
 // 3) Momentum
-grpMom    = "3 | Momentum"
+grpMom     = "3 | Momentum"
 emaFastLen = input.int(9, "Fast EMA length", minval=1, group=grpMom)
 emaSlowLen = input.int(21, "Slow EMA length", minval=2, group=grpMom)
 rsiLen     = input.int(14, "RSI length", minval=2, group=grpMom)
 rsiMin     = input.float(55, "RSI threshold", minval=0, maxval=100, step=1, group=grpMom)
 rsiRiseMin = input.float(0.5, "Min RSI rise per bar", minval=0.0, step=0.1, group=grpMom, tooltip="RSI must rise by MORE than this since the prior bar. 0 = merely rising; higher = stricter 'accelerating, not flat'.")
 reqAccel   = input.bool(true, "Require widening EMA spread", group=grpMom, tooltip="Fast-minus-slow EMA spread must be larger than on the previous bar (momentum accelerating).")
+regGate    = input.bool(false, "Also require significant regression up-trend", group=grpMom, tooltip="When on, the linear-regression slope must be positive AND statistically significant at the chosen confidence level.")
 
 // 4) Support downside
 grpSup    = "4 | Support"
@@ -56,13 +60,42 @@ tpMode    = input.string("Risk multiple", "Take-profit method", options=["Risk m
 tpMultIn  = input.float(2.6, "Take-profit multiple (x risk)", minval=0.1, step=0.1, group=grpRR, tooltip="Never used below the minimum R:R, so the target can't undercut the filter.")
 minRR     = input.float(2.6, "Min reward / risk", minval=0.1, step=0.1, group=grpRR)
 
+// Support / resistance zones (display)
+grpZone      = "Support / resistance zones"
+showZones    = input.bool(true, "Show support / resistance zones", group=grpZone)
+zoneStr      = input.int(8, "Zone pivot strength (bars each side)", minval=2, group=grpZone, tooltip="A swing high/low must stand out from this many bars on each side. Zones appear only once confirmed (this many bars late), so they never repaint.")
+zoneAtrMult  = input.float(0.25, "Zone half-height (x chart ATR)", minval=0.05, step=0.05, group=grpZone)
+zonesPerSide = input.int(3, "Zones shown per side", minval=1, maxval=10, group=grpZone)
+zoneMem      = input.int(30, "Zones remembered", minval=5, maxval=100, group=grpZone)
+supCol       = input.color(color.green, "Support color", group=grpZone)
+resCol       = input.color(color.red, "Resistance color", group=grpZone)
+
+// Linear regression (display, optional momentum gate above)
+grpReg    = "Linear regression"
+showReg   = input.bool(true, "Show regression line + confidence band", group=grpReg)
+regLen    = input.int(50, "Regression length (bars)", minval=10, maxval=500, group=grpReg)
+confLvl   = input.string("95%", "Confidence level", options=["90%", "95%", "99%"], group=grpReg)
+showPI    = input.bool(true, "Show prediction band (dashed)", group=grpReg, tooltip="Shaded band = confidence interval of the trend line itself. Dashed lines = prediction interval, where individual closes are expected to fall.")
+
 // Sizing & display
 grpMisc   = "Sizing & display"
 riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval=0.01, maxval=100, step=0.25, group=grpMisc, tooltip="Shares = equity x risk% / (entry - stop), capped at 100% of equity, rounded down to whole shares.")
 showTable = input.bool(true, "Show filter pass/fail table", group=grpMisc)
 showNear  = input.bool(false, "Label bars where exactly one filter fails", group=grpMisc)
 
-// ---------------------------- HELPERS --------------------------------
+// ---------------------------- TYPES & HELPERS ------------------------
+// One S/R zone built from clustered swing highs/lows.
+type Zone
+    float top
+    float bot
+    int   firstBar
+    int   lastBar
+    int   touches
+
+// Cumulative volume at each bar of one past day (for time-of-day RVOL).
+type DayCum
+    array<float> cum
+
 // Nearest stored level strictly above / at-or-below a reference price.
 nearestAbove(array<float> arr, float ref) =>
     float best = na
@@ -82,17 +115,73 @@ nearestBelow(array<float> arr, float ref) =>
 roundDown(float x) => math.floor(x / syminfo.mintick + 1e-9) * syminfo.mintick
 roundUp(float x)   => math.ceil(x / syminfo.mintick - 1e-9) * syminfo.mintick
 
+// Average cumulative volume at bar-of-day `slot` across the stored past days.
+expectedCumAt(array<DayCum> days, int slot) =>
+    float sum = 0.0
+    int cnt = 0
+    for d in days
+        if d.cum.size() > slot
+            sum += d.cum.get(slot)
+            cnt += 1
+    cnt > 0 ? sum / cnt : na
+
+// Add a confirmed swing price to the zone list: merge into an overlapping
+// zone (touch count +1) or start a new one; drop the stalest when full.
+addPivot(array<Zone> zs, float p, int pBar, float halfW, int maxZ) =>
+    bool merged = false
+    for z in zs
+        if p + halfW >= z.bot and p - halfW <= z.top
+            float t    = z.touches
+            float mid  = ((z.top + z.bot) / 2 * t + p) / (t + 1)
+            float half = math.max((z.top - z.bot) / 2, halfW)
+            z.top     := mid + half
+            z.bot     := mid - half
+            z.touches := z.touches + 1
+            z.lastBar := pBar
+            merged    := true
+            break
+    if not merged
+        zs.push(Zone.new(p + halfW, p - halfW, pBar, pBar, 1))
+        if zs.size() > maxZ
+            int stale = 0
+            for [i, z] in zs
+                if z.lastBar < zs.get(stale).lastBar
+                    stale := i
+            zs.remove(stale)
+    merged
+
+// Up to n zones entirely below (support) or above (resistance) price, nearest first.
+nearestZones(array<Zone> zs, float px, bool below, int n) =>
+    array<Zone> out  = array.new<Zone>()
+    array<Zone> pool = zs.copy()
+    for k = 1 to n
+        Zone best = na
+        int bestIdx = -1
+        for [j, z] in pool
+            bool onSide = below ? z.top < px : z.bot > px
+            if onSide and (na(best) or (below ? z.top > best.top : z.bot < best.bot))
+                best    := z
+                bestIdx := j
+        if bestIdx >= 0
+            out.push(best)
+            pool.remove(bestIdx)
+    out
+
+drawZone(Zone z, color c, string tag) =>
+    box.new(math.max(z.firstBar, bar_index - 4999), z.top, bar_index + 5, z.bot, border_color=color.new(c, 40), bgcolor=color.new(c, 85), extend=extend.right, text=tag + " x" + str.tostring(z.touches), text_color=c, text_size=size.tiny, text_halign=text.align_right, text_valign=text.align_center)
+
 // ---------------------------- INDICATORS -----------------------------
 atr        = ta.atr(volLen)
 bbBasis    = ta.sma(close, volLen)
 bbDev      = ta.stdev(close, volLen)
-volAvg     = ta.sma(volume, volAvgLen)
 emaFast    = ta.ema(close, emaFastLen)
 emaSlow    = ta.ema(close, emaSlowLen)
 rsi        = ta.rsi(close, rsiLen)
 swingLow   = ta.lowest(low, swingLen)
 pivLowNew  = ta.pivotlow(low, pivL, pivR)     // value is confirmed pivR bars late: no look-ahead
 pivHighNew = ta.pivothigh(high, pivL, pivR)
+zPivHigh   = ta.pivothigh(high, zoneStr, zoneStr)
+zPivLow    = ta.pivotlow(low, zoneStr, zoneStr)
 
 var array<float> pivLows  = array.new<float>()
 var array<float> pivHighs = array.new<float>()
@@ -105,27 +194,77 @@ if not na(pivHighNew)
     if pivHighs.size() > pivMem
         pivHighs.shift()
 
+// Support / resistance zones from confirmed swings.
+var array<Zone> zones = array.new<Zone>()
+if not na(zPivHigh) and not na(atr)
+    addPivot(zones, zPivHigh, bar_index - zoneStr, zoneAtrMult * atr, zoneMem)
+if not na(zPivLow) and not na(atr)
+    addPivot(zones, zPivLow, bar_index - zoneStr, zoneAtrMult * atr, zoneMem)
+
+// Daily data. request.security() is required: official daily volume and the
+// daily ATR cannot be rebuilt reliably from 30-minute bars. [1] with
+// lookahead_on returns the last COMPLETED day's values (no repainting).
+[advD, dAtrPct] = request.security(syminfo.tickerid, "1D", [ta.sma(volume, advLen)[1], ta.atr(volLen)[1] / close[1] * 100], lookahead=barmerge.lookahead_on)
+
+// Time-of-day relative volume, built from the chart's own bars:
+// today's cumulative volume vs the average cumulative volume at the same
+// bar of the day over the last advLen days.
+var array<DayCum> pastDays = array.new<DayCum>()
+var array<float>  todayCum = array.new<float>()
+if timeframe.change("1D") and todayCum.size() > 0
+    pastDays.push(DayCum.new(todayCum.copy()))
+    if pastDays.size() > advLen
+        pastDays.shift()
+    todayCum.clear()
+float volToday = (todayCum.size() > 0 ? todayCum.last() : 0.0) + nz(volume)
+todayCum.push(volToday)
+expectedCum = expectedCumAt(pastDays, todayCum.size() - 1)
+rvol        = expectedCum > 0 ? volToday / expectedCum : na
+
+// Linear regression over the last regLen closes (least squares).
+float nF    = regLen
+regEnd      = ta.linreg(close, regLen, 0)
+regStart    = ta.linreg(close, regLen, regLen - 1)
+regSlope    = (regEnd - regStart) / (nF - 1)
+regR        = ta.correlation(close, bar_index, regLen)
+regSd       = ta.stdev(close, regLen)
+regR2       = regR * regR
+regSxx      = nF * (nF * nF - 1) / 12
+regXMid     = (nF - 1) / 2
+regS        = math.sqrt(math.max(nF * regSd * regSd * (1 - regR2), 0) / (nF - 2))   // residual std error
+regSeSlope  = regS / math.sqrt(regSxx)
+regT        = regSeSlope > 0 ? regSlope / regSeSlope : na
+zCrit       = confLvl == "90%" ? 1.645 : confLvl == "95%" ? 1.96 : 2.576
+regDf       = nF - 2
+tCrit       = zCrit + (math.pow(zCrit, 3) + zCrit) / (4 * regDf) + (5 * math.pow(zCrit, 5) + 16 * math.pow(zCrit, 3) + 3 * zCrit) / (96 * regDf * regDf)   // Student-t critical value (Cornish-Fisher)
+trendUp     = regT > tCrit
+trendDn     = regT < -tCrit
+regSlopePct = regSlope / close * 100
+
 // ---------------------------- FILTER 1: VOLATILITY -------------------
 // Only trade when volatility is elevated: chosen measure (in %) must be
-// strictly above the minimum.
+// strictly above the minimum. Daily ATR % keeps the 2% default meaningful
+// on a 30-minute chart.
 atrPct      = atr / close * 100
 bbWidthPct  = bbBasis != 0 ? 2 * bbMult * bbDev / bbBasis * 100 : na
-volValue    = volMode == "ATR % of close" ? atrPct : bbWidthPct
+volValue    = volMode == "Daily ATR % (prev day)" ? dAtrPct : volMode == "Chart ATR % of close" ? atrPct : bbWidthPct
 volOk       = not na(volValue) and volValue > volMin
 
-// ---------------------------- FILTER 2: LIQUIDITY / VOLUME -----------
-// Average volume must meet the minimum AND the current bar's volume must
-// exceed that average (participation on the signal bar).
-liqOk       = volAvg >= minAvgVol and volume > volAvg
+// ---------------------------- FILTER 2: LIQUIDITY (DAILY VOLUME) -----
+// Average DAILY volume over the last advLen completed days must meet the
+// minimum AND today's volume so far must be running above a normal day
+// at the same time of day (relative volume > rvolMin).
+liqOk       = advD >= minAdv and rvol > rvolMin
 
 // ---------------------------- FILTER 3: MOMENTUM ---------------------
 // Close above a rising fast EMA, fast EMA above slow EMA, RSI above its
 // threshold and rising by more than a minimum; optionally the EMA spread
-// must be widening so momentum is accelerating rather than flat.
+// must be widening (accelerating, not flat) and the regression slope must
+// be a significant up-trend.
 emaSpread   = emaFast - emaSlow
 spreadWiden = emaSpread > emaSpread[1]
 rsiRise     = rsi - rsi[1]
-momOk       = close > emaFast and emaFast > emaFast[1] and emaFast > emaSlow and rsi > rsiMin and rsiRise > rsiRiseMin and (not reqAccel or spreadWiden)
+momOk       = close > emaFast and emaFast > emaFast[1] and emaFast > emaSlow and rsi > rsiMin and rsiRise > rsiRiseMin and (not reqAccel or spreadWiden) and (not regGate or trendUp)
 
 // ---------------------------- FILTER 4: SUPPORT DOWNSIDE -------------
 // Support = the NEAREST level at or below price among: swing low over the
@@ -193,6 +332,8 @@ plot(liqOk ? 1 : 0, "F2 Liquidity",  display=display.data_window)
 plot(momOk ? 1 : 0, "F3 Momentum",   display=display.data_window)
 plot(supOk ? 1 : 0, "F4 Support",    display=display.data_window)
 plot(rrOk ? 1 : 0,  "F5 Risk/Reward", display=display.data_window)
+plot(advD, "Avg daily volume", display=display.data_window)
+plot(rvol, "Relative volume (time of day)", display=display.data_window)
 
 // Entry label with every filter's result.
 if enterNow
@@ -206,22 +347,87 @@ if showNear and barstate.isconfirmed and strategy.position_size == 0 and nPass =
     failed = not volOk ? "Volatility" : not liqOk ? "Liquidity" : not momOk ? "Momentum" : not supOk ? "Support" : "R:R"
     label.new(bar_index, high, "✘ " + failed, style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
 
-// Pass/fail table (top-right). Shows the latest bar; final once that bar closes.
-f_row(table t, int r, string name, string detail, bool ok) =>
-    table.cell(t, 0, r, name,   text_color=color.white, text_halign=text.align_left,  bgcolor=color.new(color.black, 15))
-    table.cell(t, 1, r, detail, text_color=color.white, text_halign=text.align_left,  bgcolor=color.new(color.black, 15))
-    table.cell(t, 2, r, ok ? "✔ PASS" : "✘ FAIL", text_color=color.white, bgcolor=ok ? color.new(color.green, 20) : color.new(color.red, 20))
+// Support / resistance zones: nearest zones below price (support), above
+// price (resistance) and any zone price is trading inside. Redrawn on the
+// last bar from confirmed swings only.
+var array<box> zoneBoxes = array.new<box>()
+if showZones and barstate.islast
+    for b in zoneBoxes
+        b.delete()
+    zoneBoxes.clear()
+    array<Zone> supZones = nearestZones(zones, close, true, zonesPerSide)
+    array<Zone> resZones = nearestZones(zones, close, false, zonesPerSide)
+    for z in supZones
+        zoneBoxes.push(drawZone(z, supCol, "S"))
+    for z in resZones
+        zoneBoxes.push(drawZone(z, resCol, "R"))
+    for z in zones
+        if z.bot <= close and z.top >= close
+            zoneBoxes.push(drawZone(z, color.gray, "S/R"))
 
-var table tbl = table.new(position.top_right, 3, 7, border_width=1, border_color=color.new(color.gray, 50))
+// Linear regression line over the last regLen bars with a shaded
+// confidence band (where the true trend line lies) and optional dashed
+// prediction band (where single closes should fall).
+var line     regLine = na
+var polyline ciPoly  = na
+var polyline piUpper = na
+var polyline piLower = na
+if showReg and barstate.islast and not na(regS)
+    if not na(regLine)
+        regLine.delete()
+    if not na(ciPoly)
+        ciPoly.delete()
+    if not na(piUpper)
+        piUpper.delete()
+    if not na(piLower)
+        piLower.delete()
+    regCol = trendUp ? color.teal : trendDn ? color.maroon : color.gray
+    x0 = bar_index - regLen + 1
+    array<chart.point> ciPts = array.new<chart.point>()
+    array<chart.point> upPts = array.new<chart.point>()
+    array<chart.point> dnPts = array.new<chart.point>()
+    array<float> ciLow = array.new<float>()
+    for i = 0 to regLen - 1
+        float dx   = i - regXMid
+        float fit  = regStart + regSlope * i
+        float ciW  = tCrit * regS * math.sqrt(1.0 / nF + dx * dx / regSxx)
+        float piW  = tCrit * regS * math.sqrt(1.0 + 1.0 / nF + dx * dx / regSxx)
+        ciPts.push(chart.point.from_index(x0 + i, fit + ciW))
+        ciLow.push(fit - ciW)
+        upPts.push(chart.point.from_index(x0 + i, fit + piW))
+        dnPts.push(chart.point.from_index(x0 + i, fit - piW))
+    for i = regLen - 1 to 0
+        ciPts.push(chart.point.from_index(x0 + i, ciLow.get(i)))
+    ciPoly  := polyline.new(ciPts, closed=true, xloc=xloc.bar_index, line_color=color.new(regCol, 60), fill_color=color.new(regCol, 80))
+    regLine := line.new(x0, regStart, bar_index, regEnd, color=regCol, width=2)
+    if showPI
+        piUpper := polyline.new(upPts, xloc=xloc.bar_index, line_color=color.new(regCol, 30), line_style=line.style_dashed)
+        piLower := polyline.new(dnPts, xloc=xloc.bar_index, line_color=color.new(regCol, 30), line_style=line.style_dashed)
+
+// Pass/fail table (top-right). Shows the latest bar; final once that bar closes.
+f_row(table t, int r, string name, string detail, string status, color statusBg) =>
+    table.cell(t, 0, r, name,   text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
+    table.cell(t, 1, r, detail, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
+    table.cell(t, 2, r, status, text_color=color.white, bgcolor=statusBg)
+
+passTxt(bool ok) => ok ? "✔ PASS" : "✘ FAIL"
+passBg(bool ok)  => ok ? color.new(color.green, 20) : color.new(color.red, 20)
+
+tfOk = timeframe.isintraday and timeframe.multiplier == 30
+
+var table tbl = table.new(position.top_right, 3, 9, border_width=1, border_color=color.new(color.gray, 50))
 if showTable and barstate.islast
-    table.cell(tbl, 0, 0, "Filter", text_color=color.white, bgcolor=color.new(color.gray, 20))
-    table.cell(tbl, 1, 0, "Value vs rule", text_color=color.white, bgcolor=color.new(color.gray, 20))
-    table.cell(tbl, 2, 0, "Status", text_color=color.white, bgcolor=color.new(color.gray, 20))
-    f_row(tbl, 1, "1 Volatility", str.tostring(volValue, "#.##") + "% > " + str.tostring(volMin, "#.##") + "%", volOk)
-    f_row(tbl, 2, "2 Liquidity", "avg " + str.tostring(volAvg, format.volume) + " >= " + str.tostring(minAvgVol, format.volume) + "; vol > avg", liqOk)
-    f_row(tbl, 3, "3 Momentum", "RSI " + str.tostring(rsi, "#.#") + " (>" + str.tostring(rsiMin, "#.#") + ", +" + str.tostring(rsiRise, "#.##") + ")", momOk)
-    f_row(tbl, 4, "4 Support", str.tostring(supDistPct, "#.##") + "% above (max " + str.tostring(maxDist, "#.##") + "%)", supOk)
-    f_row(tbl, 5, "5 Risk/Reward", "R:R " + str.tostring(rr, "#.##") + " (min " + str.tostring(minRR, "#.##") + ")", rrOk)
-    table.cell(tbl, 0, 6, "SIGNAL", text_color=color.white, bgcolor=color.new(color.gray, 20))
-    table.cell(tbl, 1, 6, strategy.position_size > 0 ? "In trade" : "Flat", text_color=color.white, bgcolor=color.new(color.gray, 20))
-    table.cell(tbl, 2, 6, allOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=allOk ? color.new(color.green, 20) : color.new(color.gray, 20))
+    hdrBg = color.new(color.gray, 20)
+    table.cell(tbl, 0, 0, "Filter", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 1, 0, "Value vs rule", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 2, 0, "Status", text_color=color.white, bgcolor=hdrBg)
+    f_row(tbl, 1, "1 Volatility", str.tostring(volValue, "#.##") + "% > " + str.tostring(volMin, "#.##") + "%", passTxt(volOk), passBg(volOk))
+    f_row(tbl, 2, "2 Liquidity", "ADV " + str.tostring(advD, format.volume) + " >= " + str.tostring(minAdv, format.volume) + "; RVOL " + str.tostring(rvol, "#.##") + "x > " + str.tostring(rvolMin, "#.##") + "x", passTxt(liqOk), passBg(liqOk))
+    f_row(tbl, 3, "3 Momentum", "RSI " + str.tostring(rsi, "#.#") + " (>" + str.tostring(rsiMin, "#.#") + ", +" + str.tostring(rsiRise, "#.##") + ")", passTxt(momOk), passBg(momOk))
+    f_row(tbl, 4, "4 Support", str.tostring(supDistPct, "#.##") + "% above (max " + str.tostring(maxDist, "#.##") + "%)", passTxt(supOk), passBg(supOk))
+    f_row(tbl, 5, "5 Risk/Reward", "R:R " + str.tostring(rr, "#.##") + " (min " + str.tostring(minRR, "#.##") + ")", passTxt(rrOk), passBg(rrOk))
+    f_row(tbl, 6, "LinReg trend", "slope " + str.tostring(regSlopePct, "#.###") + "%/bar, R² " + str.tostring(regR2, "#.##") + ", t " + str.tostring(regT, "#.#") + " (" + confLvl + ")", trendUp ? "▲ UP" : trendDn ? "▼ DOWN" : "FLAT", trendUp ? color.new(color.teal, 20) : trendDn ? color.new(color.maroon, 20) : hdrBg)
+    f_row(tbl, 7, "Chart timeframe", timeframe.period + (tfOk ? " (30m)" : " - switch chart to 30m"), tfOk ? "OK" : "CHECK", tfOk ? hdrBg : color.new(color.orange, 20))
+    table.cell(tbl, 0, 8, "SIGNAL", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 1, 8, strategy.position_size > 0 ? "In trade" : "Flat", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 2, 8, allOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=allOk ? color.new(color.green, 20) : hdrBg)
