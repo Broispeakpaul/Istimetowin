@@ -1,0 +1,227 @@
+//@version=6
+strategy("Five-Filter Long Strategy", shorttitle="5F Long", overlay=true,
+     pyramiding=0, process_orders_on_close=true, calc_on_every_tick=false,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     initial_capital=100000, max_labels_count=500)
+
+// =====================================================================
+//  Long-only strategy. A long entry fires on a CONFIRMED bar close only
+//  when ALL five filters pass on that bar:
+//    1) Volatility   2) Liquidity / volume   3) Momentum
+//    4) Support downside   5) Risk-to-reward
+//  Every threshold below is an input. The bracketed values you left in the
+//  brief were filled with the examples you gave ("ex: ..."); change them in
+//  Settings > Inputs.
+// =====================================================================
+
+// ---------------------------- INPUTS ---------------------------------
+// 1) Volatility
+grpVol    = "1 | Volatility"
+volMode   = input.string("ATR % of close", "Volatility measure", options=["ATR % of close", "Bollinger width %"], group=grpVol, tooltip="ATR % = ATR(length) / close * 100. Bollinger width % = (upper - lower) / basis * 100. The ATR length is also used by the ATR stop.")
+volLen    = input.int(14, "Volatility length (ATR / BB)", minval=2, group=grpVol)
+bbMult    = input.float(2.0, "Bollinger multiplier", minval=0.1, step=0.1, group=grpVol)
+volMin    = input.float(2.0, "Min volatility (%)", minval=0.0, step=0.1, group=grpVol)
+
+// 2) Liquidity / volume
+grpLiq    = "2 | Liquidity / volume"
+volAvgLen = input.int(20, "Average volume length", minval=2, group=grpLiq)
+minAvgVol = input.float(1000000, "Min average volume (shares)", minval=0, step=100000, group=grpLiq)
+
+// 3) Momentum
+grpMom    = "3 | Momentum"
+emaFastLen = input.int(9, "Fast EMA length", minval=1, group=grpMom)
+emaSlowLen = input.int(21, "Slow EMA length", minval=2, group=grpMom)
+rsiLen     = input.int(14, "RSI length", minval=2, group=grpMom)
+rsiMin     = input.float(55, "RSI threshold", minval=0, maxval=100, step=1, group=grpMom)
+rsiRiseMin = input.float(0.5, "Min RSI rise per bar", minval=0.0, step=0.1, group=grpMom, tooltip="RSI must rise by MORE than this since the prior bar. 0 = merely rising; higher = stricter 'accelerating, not flat'.")
+reqAccel   = input.bool(true, "Require widening EMA spread", group=grpMom, tooltip="Fast-minus-slow EMA spread must be larger than on the previous bar (momentum accelerating).")
+
+// 4) Support downside
+grpSup    = "4 | Support"
+swingLen  = input.int(20, "Swing-low lookback (bars)", minval=2, group=grpSup)
+maxDist   = input.float(3.0, "Max distance above support (%)", minval=0.1, step=0.1, group=grpSup)
+useSwing  = input.bool(true, "Use swing low", group=grpSup)
+useEma    = input.bool(true, "Use slow EMA (if below price)", group=grpSup)
+usePivot  = input.bool(true, "Use prior pivot low", group=grpSup)
+pivL      = input.int(5, "Pivot bars left", minval=1, group=grpSup)
+pivR      = input.int(5, "Pivot bars right (confirmation delay)", minval=1, group=grpSup)
+pivMem    = input.int(10, "Pivots remembered", minval=1, maxval=50, group=grpSup)
+
+// 5) Stop / target / risk-to-reward
+grpRR     = "5 | Stop, target, risk-to-reward"
+stopMode  = input.string("Tighter of both", "Stop method", options=["Swing low", "ATR", "Tighter of both"], group=grpRR, tooltip="Swing low = just below the swing low. ATR = entry - ATR multiple. Tighter of both = whichever stop is closer to entry.")
+stopBuf   = input.float(0.1, "Swing-stop buffer (x ATR below swing low)", minval=0.0, step=0.05, group=grpRR)
+atrMult   = input.float(2.0, "ATR stop multiple", minval=0.1, step=0.1, group=grpRR)
+tpMode    = input.string("Risk multiple", "Take-profit method", options=["Risk multiple", "Prior pivot high"], group=grpRR, tooltip="Risk multiple = entry + multiple x risk. Prior pivot high = nearest confirmed pivot high above entry (no signal if none exists).")
+tpMultIn  = input.float(2.6, "Take-profit multiple (x risk)", minval=0.1, step=0.1, group=grpRR, tooltip="Never used below the minimum R:R, so the target can't undercut the filter.")
+minRR     = input.float(2.6, "Min reward / risk", minval=0.1, step=0.1, group=grpRR)
+
+// Sizing & display
+grpMisc   = "Sizing & display"
+riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval=0.01, maxval=100, step=0.25, group=grpMisc, tooltip="Shares = equity x risk% / (entry - stop), capped at 100% of equity, rounded down to whole shares.")
+showTable = input.bool(true, "Show filter pass/fail table", group=grpMisc)
+showNear  = input.bool(false, "Label bars where exactly one filter fails", group=grpMisc)
+
+// ---------------------------- HELPERS --------------------------------
+// Nearest stored level strictly above / at-or-below a reference price.
+nearestAbove(array<float> arr, float ref) =>
+    float best = na
+    for v in arr
+        if v > ref and (na(best) or v < best)
+            best := v
+    best
+
+nearestBelow(array<float> arr, float ref) =>
+    float best = na
+    for v in arr
+        if v <= ref and (na(best) or v > best)
+            best := v
+    best
+
+// Tick rounding that never shrinks risk or reward (keeps R:R >= target).
+roundDown(float x) => math.floor(x / syminfo.mintick + 1e-9) * syminfo.mintick
+roundUp(float x)   => math.ceil(x / syminfo.mintick - 1e-9) * syminfo.mintick
+
+// ---------------------------- INDICATORS -----------------------------
+atr        = ta.atr(volLen)
+bbBasis    = ta.sma(close, volLen)
+bbDev      = ta.stdev(close, volLen)
+volAvg     = ta.sma(volume, volAvgLen)
+emaFast    = ta.ema(close, emaFastLen)
+emaSlow    = ta.ema(close, emaSlowLen)
+rsi        = ta.rsi(close, rsiLen)
+swingLow   = ta.lowest(low, swingLen)
+pivLowNew  = ta.pivotlow(low, pivL, pivR)     // value is confirmed pivR bars late: no look-ahead
+pivHighNew = ta.pivothigh(high, pivL, pivR)
+
+var array<float> pivLows  = array.new<float>()
+var array<float> pivHighs = array.new<float>()
+if not na(pivLowNew)
+    pivLows.push(pivLowNew)
+    if pivLows.size() > pivMem
+        pivLows.shift()
+if not na(pivHighNew)
+    pivHighs.push(pivHighNew)
+    if pivHighs.size() > pivMem
+        pivHighs.shift()
+
+// ---------------------------- FILTER 1: VOLATILITY -------------------
+// Only trade when volatility is elevated: chosen measure (in %) must be
+// strictly above the minimum.
+atrPct      = atr / close * 100
+bbWidthPct  = bbBasis != 0 ? 2 * bbMult * bbDev / bbBasis * 100 : na
+volValue    = volMode == "ATR % of close" ? atrPct : bbWidthPct
+volOk       = not na(volValue) and volValue > volMin
+
+// ---------------------------- FILTER 2: LIQUIDITY / VOLUME -----------
+// Average volume must meet the minimum AND the current bar's volume must
+// exceed that average (participation on the signal bar).
+liqOk       = volAvg >= minAvgVol and volume > volAvg
+
+// ---------------------------- FILTER 3: MOMENTUM ---------------------
+// Close above a rising fast EMA, fast EMA above slow EMA, RSI above its
+// threshold and rising by more than a minimum; optionally the EMA spread
+// must be widening so momentum is accelerating rather than flat.
+emaSpread   = emaFast - emaSlow
+spreadWiden = emaSpread > emaSpread[1]
+rsiRise     = rsi - rsi[1]
+momOk       = close > emaFast and emaFast > emaFast[1] and emaFast > emaSlow and rsi > rsiMin and rsiRise > rsiRiseMin and (not reqAccel or spreadWiden)
+
+// ---------------------------- FILTER 4: SUPPORT DOWNSIDE -------------
+// Support = the NEAREST level at or below price among: swing low over the
+// lookback, slow EMA (when under price) and the closest prior pivot low.
+// Entry must sit within maxDist % above it.
+float support = na
+float supSwing = useSwing ? swingLow : na
+float supEma   = (useEma and emaSlow <= close) ? emaSlow : na
+float supPivot = usePivot ? nearestBelow(pivLows, close) : na
+if not na(supSwing)
+    support := supSwing
+if not na(supEma) and (na(support) or supEma > support)
+    support := supEma
+if not na(supPivot) and (na(support) or supPivot > support)
+    support := supPivot
+supDistPct  = support > 0 ? (close - support) / support * 100 : na
+supOk       = not na(supDistPct) and supDistPct <= maxDist
+
+// ---------------------------- FILTER 5: RISK-TO-REWARD ---------------
+// Entry = this bar's close. Stop and target are computed BEFORE entry; the
+// signal is skipped outright unless reward / risk >= minRR.
+tpMult      = math.max(tpMultIn, minRR)
+stopSwing   = swingLow - stopBuf * atr
+stopAtr     = close - atrMult * atr
+stopRaw     = stopMode == "Swing low" ? stopSwing : stopMode == "ATR" ? stopAtr : math.max(stopSwing, stopAtr)
+stopPx      = roundDown(stopRaw)
+riskPx      = close - stopPx
+tpRaw       = tpMode == "Risk multiple" ? close + tpMult * riskPx : nearestAbove(pivHighs, close)
+tpPx        = tpMode == "Risk multiple" ? roundUp(tpRaw) : tpRaw
+rewardPx    = tpPx - close
+rr          = riskPx > 0 ? rewardPx / riskPx : na
+rrOk        = not na(rr) and rr >= minRR - 1e-9
+
+// ---------------------------- SIGNAL & ORDERS ------------------------
+allOk    = volOk and liqOk and momOk and supOk and rrOk
+qty      = math.floor(math.min(strategy.equity * riskPct / 100 / riskPx, strategy.equity / close))
+enterNow = barstate.isconfirmed and strategy.position_size == 0 and allOk and qty >= 1
+
+var float entryPx = na
+var float slPx    = na
+var float tpLvl   = na
+
+if enterNow
+    entryPx := close
+    slPx    := stopPx
+    tpLvl   := tpPx
+    strategy.entry("Long", strategy.long, qty=qty)
+
+// Real TP/SL orders. Placed on the entry bar and re-issued while in the trade.
+if enterNow or strategy.position_size > 0
+    strategy.exit("Exit", from_entry="Long", stop=slPx, limit=tpLvl)
+
+// ---------------------------- CHART OUTPUT ---------------------------
+inTrade = strategy.position_size > 0 or strategy.position_size[1] > 0 or enterNow
+plot(inTrade ? entryPx : na, "Entry",  color=color.new(color.blue, 0),  linewidth=1, style=plot.style_linebr)
+plot(inTrade ? slPx : na,    "Stop",   color=color.new(color.red, 0),   linewidth=1, style=plot.style_linebr)
+plot(inTrade ? tpLvl : na,   "Target", color=color.new(color.green, 0), linewidth=1, style=plot.style_linebr)
+plot(support, "Support used", color=color.new(color.orange, 70), style=plot.style_linebr, display=display.pane)
+plot(emaFast, "Fast EMA", color=color.new(color.aqua, 40))
+plot(emaSlow, "Slow EMA", color=color.new(color.purple, 40))
+
+// Per-bar filter results in the Data Window (1 = pass, 0 = fail).
+plot(volOk ? 1 : 0, "F1 Volatility", display=display.data_window)
+plot(liqOk ? 1 : 0, "F2 Liquidity",  display=display.data_window)
+plot(momOk ? 1 : 0, "F3 Momentum",   display=display.data_window)
+plot(supOk ? 1 : 0, "F4 Support",    display=display.data_window)
+plot(rrOk ? 1 : 0,  "F5 Risk/Reward", display=display.data_window)
+
+// Entry label with every filter's result.
+if enterNow
+    label.new(bar_index, low,
+         "LONG  R:R " + str.tostring(rr, "#.##") + "\nSL " + str.tostring(stopPx, format.mintick) + "  TP " + str.tostring(tpPx, format.mintick) + "\nVol ✔  Liq ✔  Mom ✔  Sup ✔  R:R ✔",
+         style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+
+// Optional near-miss label: exactly one filter failing.
+nPass = (volOk ? 1 : 0) + (liqOk ? 1 : 0) + (momOk ? 1 : 0) + (supOk ? 1 : 0) + (rrOk ? 1 : 0)
+if showNear and barstate.isconfirmed and strategy.position_size == 0 and nPass == 4
+    failed = not volOk ? "Volatility" : not liqOk ? "Liquidity" : not momOk ? "Momentum" : not supOk ? "Support" : "R:R"
+    label.new(bar_index, high, "✘ " + failed, style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+
+// Pass/fail table (top-right). Shows the latest bar; final once that bar closes.
+f_row(table t, int r, string name, string detail, bool ok) =>
+    table.cell(t, 0, r, name,   text_color=color.white, text_halign=text.align_left,  bgcolor=color.new(color.black, 15))
+    table.cell(t, 1, r, detail, text_color=color.white, text_halign=text.align_left,  bgcolor=color.new(color.black, 15))
+    table.cell(t, 2, r, ok ? "✔ PASS" : "✘ FAIL", text_color=color.white, bgcolor=ok ? color.new(color.green, 20) : color.new(color.red, 20))
+
+var table tbl = table.new(position.top_right, 3, 7, border_width=1, border_color=color.new(color.gray, 50))
+if showTable and barstate.islast
+    table.cell(tbl, 0, 0, "Filter", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 1, 0, "Value vs rule", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 2, 0, "Status", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    f_row(tbl, 1, "1 Volatility", str.tostring(volValue, "#.##") + "% > " + str.tostring(volMin, "#.##") + "%", volOk)
+    f_row(tbl, 2, "2 Liquidity", "avg " + str.tostring(volAvg, format.volume) + " >= " + str.tostring(minAvgVol, format.volume) + "; vol > avg", liqOk)
+    f_row(tbl, 3, "3 Momentum", "RSI " + str.tostring(rsi, "#.#") + " (>" + str.tostring(rsiMin, "#.#") + ", +" + str.tostring(rsiRise, "#.##") + ")", momOk)
+    f_row(tbl, 4, "4 Support", str.tostring(supDistPct, "#.##") + "% above (max " + str.tostring(maxDist, "#.##") + "%)", supOk)
+    f_row(tbl, 5, "5 Risk/Reward", "R:R " + str.tostring(rr, "#.##") + " (min " + str.tostring(minRR, "#.##") + ")", rrOk)
+    table.cell(tbl, 0, 6, "SIGNAL", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 1, 6, strategy.position_size > 0 ? "In trade" : "Flat", text_color=color.white, bgcolor=color.new(color.gray, 20))
+    table.cell(tbl, 2, 6, allOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=allOk ? color.new(color.green, 20) : color.new(color.gray, 20))
