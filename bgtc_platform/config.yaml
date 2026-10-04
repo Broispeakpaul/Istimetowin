@@ -1,0 +1,168 @@
+# ---------------------------------------------------------------------------
+# Bloomberg Global Trading Challenge 2026 - earnings catalyst platform config
+# Every threshold lives here. See docs/DESIGN.md for why each default was
+# chosen; items marked [PLAYBOOK?] should be checked against the playbook.
+# ---------------------------------------------------------------------------
+
+data_source: yahoo            # yahoo | bloomberg | fixture (fixture = synthetic test data)
+timezone: Asia/Hong_Kong
+
+paths:
+  members: data/wls_members.csv
+  positions: data/positions.csv
+  earnings_overrides: data/earnings_overrides.csv
+  manual_checks: data/manual_checks.csv
+  account: data/account.csv
+  cache_dir: data/cache
+  reports_dir: reports
+
+benchmark:
+  bloomberg_ticker: "WLS Index"
+  fallback_yahoo: VT            # used with a clear warning when WLS is unavailable
+  vix_bloomberg: "VIX Index"
+  vix_yahoo: "^VIX"
+  calendar: XNYS                # calendar used to decide whether today's benchmark close should exist
+
+history:
+  lookback_calendar_days: 900   # enough for 2y weekly beta + 50d averages
+
+entry:
+  min_day_one_rel_return: 0.08
+  relative_return_method: difference   # difference | ratio   [PLAYBOOK?]
+  min_volume_ratio: 2.0
+  volume_avg_window: 50
+  min_adv_usd: 50000000
+  adv_window: 50
+  require_wls_member: true
+
+themes:
+  max_names_per_theme: 2
+  max_weight_per_theme: 0.35
+  groups:                       # themes that count as one
+    semiconductors: semis_software
+    software: semis_software
+  scope: all                    # all | catalyst_only   [PLAYBOOK?]
+  cap_mode: shrink              # shrink | reject
+
+sizing:
+  risk_budget: 0.005            # weight = risk_budget / ATR%
+  atr_window: 14
+  atr_method: wilder            # wilder | simple
+  atr_include_day_one: true     # [PLAYBOOK?]
+  min_weight: 0.04
+  max_weight: 0.15
+  tranche_split: [0.5, 0.5]
+  second_tranche_session: 3     # day one = session 1   [PLAYBOOK?]
+  block_second_tranche_in_derisk: true
+  earnings_hold_risk: 0.01      # weight <= 1% / (multiplier x implied move)
+  implied_move_multiplier: 1.5
+  earnings_hold_lookahead_sessions: 5
+
+competition:
+  max_position_weight: 0.20     # hard rule of the challenge
+  long_only: true
+  allow_leverage: false
+
+exits:
+  relative_stop: -0.08
+  trim_trigger: 0.18
+  trim_target: 0.15
+  time_stop_sessions: null      # playbook: no time stop
+  core_reverse_rel_return: -0.04
+  core_reverse_volume_ratio: 2.0
+  core_reverse_sell_fraction: 0.5
+
+regime:
+  sma_window: 50
+  vix_threshold: 25
+  target_beta: 1.0
+
+staging:
+  horizon_sessions: 5
+  heavyweight_top_n: 20
+  recommend_cash_staging: false
+
+calendar_view:
+  horizon_sessions: 10
+
+beta:
+  years: 2
+  frequency: W-FRI
+  raw_weight: 0.67
+  prior_weight: 0.33
+  min_observations: 52
+
+earnings:
+  cache_ttl_hours: 12
+  unknown_timing: both          # both | bmo | amc
+  history_limit: 40             # yahoo: number of past/future report dates to request
+
+# Bloomberg exchange code (the part after the ticker in "7203 JT Equity")
+# -> trading calendar, which daily run covers it, currency, Yahoo suffix, board lot.
+exchanges:
+  US: {calendar: XNYS, session: us, currency: USD, yahoo_suffix: ""}
+  UN: {calendar: XNYS, session: us, currency: USD, yahoo_suffix: ""}
+  UW: {calendar: XNYS, session: us, currency: USD, yahoo_suffix: ""}
+  CN: {calendar: XTSE, session: us, currency: CAD, yahoo_suffix: ".TO"}
+  CT: {calendar: XTSE, session: us, currency: CAD, yahoo_suffix: ".TO"}
+  BZ: {calendar: BVMF, session: us, currency: BRL, yahoo_suffix: ".SA"}
+  MM: {calendar: XMEX, session: us, currency: MXN, yahoo_suffix: ".MX"}
+  JT: {calendar: XTKS, session: asia, currency: JPY, yahoo_suffix: ".T", lot_size: 100}
+  JP: {calendar: XTKS, session: asia, currency: JPY, yahoo_suffix: ".T", lot_size: 100}
+  HK: {calendar: XHKG, session: asia, currency: HKD, yahoo_suffix: ".HK"}
+  C1: {calendar: XSHG, session: asia, currency: CNY, yahoo_suffix: ".SS", lot_size: 100}
+  C2: {calendar: XSHG, session: asia, currency: CNY, yahoo_suffix: ".SZ", lot_size: 100}
+  CH: {calendar: XSHG, session: asia, currency: CNY, yahoo_suffix: ".SS", lot_size: 100}
+  KS: {calendar: XKRX, session: asia, currency: KRW, yahoo_suffix: ".KS"}
+  TT: {calendar: XTAI, session: asia, currency: TWD, yahoo_suffix: ".TW", lot_size: 1000}
+  AT: {calendar: XASX, session: asia, currency: AUD, yahoo_suffix: ".AX"}
+  AU: {calendar: XASX, session: asia, currency: AUD, yahoo_suffix: ".AX"}
+  IN: {calendar: XBOM, session: asia, currency: INR, yahoo_suffix: ".NS"}
+  IB: {calendar: XBOM, session: asia, currency: INR, yahoo_suffix: ".BO"}
+  SP: {calendar: XSES, session: asia, currency: SGD, yahoo_suffix: ".SI", lot_size: 100}
+  NZ: {calendar: XNZE, session: asia, currency: NZD, yahoo_suffix: ".NZ"}
+  IJ: {calendar: XIDX, session: asia, currency: IDR, yahoo_suffix: ".JK", lot_size: 100}
+  MK: {calendar: XKLS, session: asia, currency: MYR, yahoo_suffix: ".KL", lot_size: 100}
+  TB: {calendar: XBKK, session: asia, currency: THB, yahoo_suffix: ".BK", lot_size: 100}
+  PM: {calendar: XPHS, session: asia, currency: PHP, yahoo_suffix: ".PS"}
+  LN: {calendar: XLON, session: europe, currency: GBp, yahoo_suffix: ".L"}
+  GY: {calendar: XETR, session: europe, currency: EUR, yahoo_suffix: ".DE"}
+  GR: {calendar: XETR, session: europe, currency: EUR, yahoo_suffix: ".DE"}
+  FP: {calendar: XPAR, session: europe, currency: EUR, yahoo_suffix: ".PA"}
+  NA: {calendar: XAMS, session: europe, currency: EUR, yahoo_suffix: ".AS"}
+  BB: {calendar: XBRU, session: europe, currency: EUR, yahoo_suffix: ".BR"}
+  PL: {calendar: XLIS, session: europe, currency: EUR, yahoo_suffix: ".LS"}
+  IM: {calendar: XMIL, session: europe, currency: EUR, yahoo_suffix: ".MI"}
+  SM: {calendar: XMAD, session: europe, currency: EUR, yahoo_suffix: ".MC"}
+  SE: {calendar: XSWX, session: europe, currency: CHF, yahoo_suffix: ".SW"}
+  SW: {calendar: XSWX, session: europe, currency: CHF, yahoo_suffix: ".SW"}
+  SS: {calendar: XSTO, session: europe, currency: SEK, yahoo_suffix: ".ST"}
+  DC: {calendar: XCSE, session: europe, currency: DKK, yahoo_suffix: ".CO"}
+  FH: {calendar: XHEL, session: europe, currency: EUR, yahoo_suffix: ".HE"}
+  "NO": {calendar: XOSL, session: europe, currency: NOK, yahoo_suffix: ".OL"}
+  ID: {calendar: XDUB, session: europe, currency: EUR, yahoo_suffix: ".IR"}
+  AV: {calendar: XWBO, session: europe, currency: EUR, yahoo_suffix: ".VI"}
+  SJ: {calendar: XJSE, session: europe, currency: ZAc, yahoo_suffix: ".JO"}
+  IT: {calendar: XTAE, session: europe, currency: ILA, yahoo_suffix: ".TA"}
+  AB: {calendar: XSAU, session: europe, currency: SAR, yahoo_suffix: ".SR"}
+
+# Bloomberg field names. Verify each with FLDS <GO> on the Terminal before first use.
+bloomberg:
+  price_fields: {open: PX_OPEN, high: PX_HIGH, low: PX_LOW, close: PX_LAST, volume: PX_VOLUME}
+  currency_field: CRNCY
+  fx_ticker_template: "{ccy}USD Curncy"
+  members_field: INDX_MWEIGHT
+  earnings_history_field: EARN_ANN_DT_TIME_HIST_WITH_EPS   # verify with FLDS
+  expected_report_date_field: EXPECTED_REPORT_DT           # verify with FLDS
+  expected_report_time_field: EXPECTED_REPORT_TIME         # verify with FLDS
+  implied_move_field: null      # set if your Terminal has an implied earnings move field
+
+backtest:
+  initial_capital: 1000000      # [check challenge rules]
+  contest_weeks: 5
+  cost_bps: 10                  # [check challenge rules]
+  idle_cash: benchmark_proxy    # benchmark_proxy | cash
+  manual_checks_assumption: pass
+  implied_move_proxy_reports: 8
+  forward_horizons: [1, 5, 10, 20, 25]
+  reaction_buckets: [-1.0, -0.08, -0.04, 0.0, 0.04, 0.08, 0.12, 10.0]
