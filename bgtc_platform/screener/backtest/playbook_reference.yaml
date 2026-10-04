@@ -1,0 +1,34 @@
+# Published numbers from Earnings_Catalyst_Playbook_v2.docx, for comparison with our backtest.
+# The docx was NOT available when this platform was built, so every value below is empty on purpose:
+# copy the figures from the playbook. Nothing here was estimated.
+#
+# For each table:
+#   title:      the playbook's caption
+#   compare_to: which of our tables it corresponds to:
+#               reaction_buckets | filter_steps | contest_rolling
+#   key_column: the column in our table that identifies a row (reaction_bucket / filter_step / start)
+#   rows:       list of {key: <row label as it appears in our table>, metric: <our column name>, value: <number>}
+#               Fractions, not percentages (3.1% -> 0.031).
+#
+# Example once filled in:
+# table1:
+#   title: "Post-earnings drift by day-one reaction"
+#   compare_to: reaction_buckets
+#   key_column: reaction_bucket
+#   rows:
+#     - {key: "+8% to +12%", metric: mean_rel_20d, value: 0.031}
+table1:
+  title: null
+  compare_to: reaction_buckets
+  key_column: reaction_bucket
+  rows: []
+table4:
+  title: null
+  compare_to: filter_steps
+  key_column: filter_step
+  rows: []
+table5:
+  title: null
+  compare_to: contest_rolling
+  key_column: start
+  rows: []
