@@ -5,7 +5,7 @@ pyyaml>=6
 pydantic>=2.5
 exchange_calendars>=4.5
 yfinance>=0.2.40
-streamlit>=1.30
+streamlit>=1.50
 pytest>=7.4
 # Optional, only on a machine with a logged-in Bloomberg Terminal:
 # blpapi   (pip install --index-url=https://blpapi.bloomberg.com/repository/releases/python/simple/ blpapi)

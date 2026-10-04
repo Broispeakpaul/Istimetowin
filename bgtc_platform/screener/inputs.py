@@ -118,6 +118,8 @@ class Ledger:
                 df[c] = ""
         if df.empty:
             df = pd.DataFrame(columns=POSITION_COLUMNS)
+        for c in ("side", "role", "thesis_break", "notes", "bbg_ticker"):
+            df[c] = df[c].astype(object).where(df[c].notna(), "")
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df["side"] = df["side"].astype(str).str.upper().str.strip()
         bad = set(df["side"]) - {"BUY", "SELL"}

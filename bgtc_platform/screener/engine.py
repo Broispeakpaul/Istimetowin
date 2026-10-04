@@ -19,7 +19,7 @@ from .rules.entry import (CANDIDATE_STATES, ST_CANDIDATE, ST_CONFIRM_C1, ST_CONF
 from .rules.events import day_one_events, event_for_day_one, next_report
 from .rules.exits import evaluate_exits
 from .rules.implied import ImpliedMoveBook, ProxyFn
-from .rules.regime import RegimeState, evaluate_regime
+from .rules.regime import RegimeState, evaluate_regime, regime_history
 from .rules.sizing import second_tranche_decision, shares_for, size_position
 from .rules.staging import earnings_calendar, staging_list
 from .rules.themes import ThemeBook
@@ -48,6 +48,7 @@ class DayResult:
     staging: pd.DataFrame
     calendar: pd.DataFrame
     session_closes: pd.DataFrame
+    regime_history: pd.DataFrame = field(default_factory=pd.DataFrame)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -220,4 +221,5 @@ def run_day(view, session: str, ledger: Ledger, manual: ManualInputs, cfg: Confi
                      data_source=view.data.source_name, benchmark_name=view.benchmark_name, warnings=warnings,
                      regime=regime, signals=signals, candidates=candidates, tranche2=tranche2, alerts=alerts,
                      portfolio=state, analytics=analytics, staging=staging, calendar=calendar,
-                     session_closes=pd.DataFrame(closes), notes=notes)
+                     session_closes=pd.DataFrame(closes), notes=notes,
+                     regime_history=regime_history(view, cfg) if with_analytics else pd.DataFrame())

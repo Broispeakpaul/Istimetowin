@@ -51,3 +51,15 @@ def evaluate_regime(view, cfg: Config) -> RegimeState:
     parts.append(f"VIX {v:.1f} (threshold {r.vix_threshold:g})" if v is not None else "VIX MISSING")
     return RegimeState(view.benchmark_name, bdate, close, sma, vdate, v, below, high, derisk,
                        summary + " | " + "; ".join(parts))
+
+
+def regime_history(view, cfg: Config, sessions: int = 260) -> pd.DataFrame:
+    """Benchmark, its moving average and VIX for the regime chart (data up to the as-of date only)."""
+    b = view.benchmark()["adj_close"].dropna()
+    if b.empty:
+        return pd.DataFrame(columns=["date", "benchmark", "sma", "vix"])
+    sma = b.rolling(cfg.regime.sma_window).mean()
+    vix = view.vix().dropna()
+    df = pd.DataFrame({"benchmark": b, "sma": sma})
+    df["vix"] = vix.reindex(df.index.union(vix.index)).ffill().reindex(df.index) if len(vix) else float("nan")
+    return df.tail(sessions).rename_axis("date").reset_index()

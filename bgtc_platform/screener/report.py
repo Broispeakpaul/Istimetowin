@@ -165,7 +165,7 @@ def write_report(res: DayResult, cfg: Config, reports_dir: Path | None = None) -
     b.mkdir(exist_ok=True)
     tables = {"signals": res.signals, "candidates": res.candidates, "tranche2": res.tranche2, "alerts": res.alerts,
               "holdings": res.portfolio.holdings, "staging": res.staging, "calendar": res.calendar,
-              "session_closes": res.session_closes}
+              "session_closes": res.session_closes, "regime_history": res.regime_history}
     if res.analytics:
         tables.update({"betas": res.analytics.betas, "themes": res.analytics.theme_exposure,
                        "active_weights": res.analytics.active_weights})
