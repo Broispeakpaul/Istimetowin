@@ -1,0 +1,7 @@
+symbol,type,announced,conviction,event_date,offer_price,expected_close,earnings_surprise_pct,guidance_raised,revisions_up,short_interest,market_cap,activist,use_options,completed,notes
+# Example rows with placeholder tickers. Copy to catalysts.csv and replace with your own research.,,,,,,,,,,,,,,,
+XMPLA,PEAD,2026-09-18,3,,,,18,yes,yes,0.14,1800000000,,no,no,Beat by 18% and raised FY guide; 3 upward revisions since
+XMPLB,ACTIVIST,2026-09-10,2,,,,,,,,4100000000,Elliott,no,no,13D filed with 6.2% stake; pushing for sale of segment
+XMPLC,CASH_MA,2026-09-05,2,,52.50,2026-11-20,,,,,1200000000,,no,no,All-cash $52.50/sh; HSR cleared; shareholder vote 2026-10-30
+XMPLD,CORP_ACTION,2026-09-01,2,,,,,,,,6000000000,,no,no,Spin-off of services unit announced; $500M buyback
+XMPLE,PEAD,2026-08-20,3,2026-10-15,,,9,yes,no,0.22,3300000000,,yes,no,Binary FDA date 10/15: trade with calls only

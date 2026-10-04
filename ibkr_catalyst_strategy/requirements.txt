@@ -1,0 +1,5 @@
+ib_async>=1.0
+pandas>=2.0
+numpy>=1.24
+rich>=13.0
+pytest>=8.0
