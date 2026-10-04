@@ -1,0 +1,8 @@
+# Fills ledger: one row per fill from TMSG. Holdings, average cost and entry dates are derived from it.
+# side: BUY or SELL | price_local: in the quote unit Bloomberg shows (pence for LSE) | fx_to_usd: USD per one unit
+# of the major currency on the fill date (e.g. 1.27 for GBP); leave blank to use market FX.
+# role: catalyst | core | staging | tranche: 1 or 2 for catalyst entries | day_one_date: the event's day one
+# thesis_break: Y to flag a manual thesis break (exit recommended)
+# Example (remove the leading # to use):
+# 2025-10-30,AAPL US Equity,BUY,500,271.40,,catalyst,1,2025-10-30,,first tranche
+date,bbg_ticker,side,quantity,price_local,fx_to_usd,role,tranche,day_one_date,thesis_break,notes

@@ -71,9 +71,12 @@ class MarketData:
 
     @classmethod
     def load(cls, source: DataSource, members: pd.DataFrame, manual: ManualInputs, cfg: Config,
-             start, end, tickers: Optional[list[str]] = None) -> "MarketData":
+             start, end, tickers: Optional[list[str]] = None,
+             earnings_tickers: Optional[list[str]] = None) -> "MarketData":
+        """Fetch prices for `tickers` and report dates for `earnings_tickers` (default: same list)."""
         start, end = pd.Timestamp(start), pd.Timestamp(end)
         tickers = list(members.index) if tickers is None else tickers
+        earnings_tickers = tickers if earnings_tickers is None else earnings_tickers
         warnings: list[str] = []
         local = source.get_prices(members, tickers, start, end)
         ccys = sorted({major_unit(members.at[t, "currency"])[0] for t in local} - {"USD"})
@@ -84,7 +87,7 @@ class MarketData:
             warnings.append(bench.warning)
         vix = source.get_vix(start, end)
         horizon_end = end + pd.Timedelta(days=45)
-        events = source.get_earnings(members, tickers, start, horizon_end)
+        events = source.get_earnings(members, earnings_tickers, start, horizon_end)
         earnings = merge_earnings(events, manual.override_events())
         implied = source.get_implied_moves(members, tickers)
         warnings.extend(source.warnings.messages)

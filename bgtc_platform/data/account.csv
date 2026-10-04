@@ -1,0 +1,3 @@
+# Optional cash/NAV snapshots copied from the competition portfolio screen. The latest row on or before the
+# run date is used for cash; fills after that date are applied on top. Without rows, cash = initial capital - fills.
+date,cash_usd,nav_usd

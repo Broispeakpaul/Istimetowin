@@ -1,0 +1,6 @@
+# Human confirmations. Blank = PENDING (shown as CONFIRM MANUALLY in the report).
+# check1_revenue_guidance: PASS if revenue beat AND guidance at or above consensus, else FAIL
+# check5_eps_revision: PASS if consensus EPS was revised up within 3 sessions, else FAIL (needed for tranche 2)
+# implied_move: implied earnings move for an upcoming report, e.g. 0.06 or 6% (from OMON / EE / your options screen)
+# report_date: the report these checks belong to (matched within +/- 4 days)
+bbg_ticker,report_date,check1_revenue_guidance,check5_eps_revision,implied_move,confirmed_by,notes

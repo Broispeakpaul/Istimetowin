@@ -1,0 +1,4 @@
+# Confirmed report dates and timing. These replace data-source dates within +/- 7 days.
+# timing: BMO (before open) | AMC (after close) | DMH (during market hours) | UNKNOWN
+# report_date is the exchange-local calendar date of the release. report_time_local is optional (HH:MM).
+bbg_ticker,report_date,timing,report_time_local,source,notes
