@@ -1,3 +1,4 @@
+import pytest
 import json
 
 import pandas as pd
@@ -38,3 +39,19 @@ def test_cli_arguments():
     assert a.session == "us" and a.date == "2025-10-30"
     a = p.parse_args(["backtest", "contest", "--start", "2025-10-06", "--rolling", "--end", "2025-11-03"])
     assert a.bt_cmd == "contest" and a.rolling
+
+
+def test_before_close_waits_for_dst_adjusted_close():
+    from screener.cli import wait_until_before_close
+    slept = []
+    # 02:00 HKT Fri 30 Oct 2026 = 14:00 Thu in New York; NYSE (EDT) closes 04:00 HKT -> wait until 03:30 = 90 min
+    now = pd.Timestamp("2026-10-30 02:00", tz="Asia/Hong_Kong").tz_convert("UTC")
+    d = wait_until_before_close("us", 30, now_utc=now, sleep=slept.append)
+    assert d == pd.Timestamp("2026-10-29") and slept[-1] == pytest.approx(90 * 60)
+    # After the US switch (Mon 2 Nov 2026 session): close is 05:00 HKT -> 03:00 HKT start waits 120 min
+    now = pd.Timestamp("2026-11-03 03:00", tz="Asia/Hong_Kong").tz_convert("UTC")
+    d = wait_until_before_close("us", 30, now_utc=now, sleep=slept.append)
+    assert d == pd.Timestamp("2026-11-02") and slept[-1] == pytest.approx(90 * 60)
+    # Saturday: no session
+    sat = pd.Timestamp("2026-10-31 15:00", tz="UTC")
+    assert wait_until_before_close("us", 30, now_utc=sat, sleep=slept.append) is None

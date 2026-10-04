@@ -36,7 +36,15 @@ class YahooAdapter(DataSource):
         super().__init__()
         self.cfg = cfg
 
+    CHUNK = 150  # symbols per request; a full WLS universe is ~3,000 names
+
     def _download(self, symbols: list[str], start, end) -> dict[str, pd.DataFrame]:
+        out: dict[str, pd.DataFrame] = {}
+        for i in range(0, len(symbols), self.CHUNK):
+            out.update(self._download_chunk(symbols[i:i + self.CHUNK], start, end))
+        return out
+
+    def _download_chunk(self, symbols: list[str], start, end) -> dict[str, pd.DataFrame]:
         if not symbols:
             return {}
         yf = _yf()

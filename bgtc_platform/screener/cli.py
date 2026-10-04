@@ -57,13 +57,36 @@ def _print_result(res, paths) -> None:
     print(f"\nReport: {paths['html']}\nSignals CSV: {paths['signals_csv']}")
 
 
+def wait_until_before_close(session: str, minutes: int, now_utc=None, sleep=None):
+    """Sleep until `minutes` before today's close of the session's anchor exchange. Returns the session
+    date, or None if that exchange has no session today. DST is handled by the exchange calendar."""
+    import time
+    anchor = cal.SESSION_ANCHOR_CALENDAR["us" if session == "all" else session]
+    now = pd.Timestamp.now(tz="UTC") if now_utc is None else now_utc
+    local_today = now.tz_convert(cal.get_calendar(anchor).tz).normalize().tz_localize(None)
+    if not cal.is_session(anchor, local_today):
+        return None
+    target = cal.session_close_utc(anchor, local_today) - pd.Timedelta(minutes=minutes)
+    wait = (target - now).total_seconds()
+    if wait > 0:
+        print(f"Waiting until {cal.fmt_hkt(target)} ({minutes} min before the {anchor} close)...", flush=True)
+        (sleep or time.sleep)(wait)
+    return local_today
+
+
 def cmd_run(args) -> int:
     from .pipeline import default_date, run_session
     from .report import write_report
     cfg = _cfg(args)
     if args.source:
         cfg.data_source = args.source
-    as_of = cal.parse_date(args.date) if args.date else default_date(args.session)
+    if args.before_close is not None:
+        as_of = wait_until_before_close(args.session, args.before_close)
+        if as_of is None:
+            print(f"No {args.session} session today; nothing to do.")
+            return 0
+    else:
+        as_of = cal.parse_date(args.date) if args.date else default_date(args.session)
     res = run_session(cfg, as_of, args.session)
     paths = write_report(res, cfg)
     _print_result(res, paths)
@@ -134,6 +157,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--session", choices=["us", "asia", "europe", "all"], required=True)
     r.add_argument("--date", help="exchange-local session date YYYY-MM-DD (default: latest closed session)")
     r.add_argument("--source", choices=["yahoo", "bloomberg"], help="override data_source in config.yaml")
+    r.add_argument("--before-close", type=int, metavar="MIN",
+                   help="preliminary run: wait until MIN minutes before today's close, then screen (rows marked PRELIMINARY)")
     r.set_defaults(func=cmd_run)
 
     d = sub.add_parser("demo", help="run on synthetic data (no network) to check the install")
@@ -167,6 +192,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    for stream in (sys.stdout, sys.stderr):  # Windows consoles/log files may not be UTF-8
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s %(message)s")
     return args.func(args)

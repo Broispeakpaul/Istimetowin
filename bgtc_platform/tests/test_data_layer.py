@@ -117,3 +117,27 @@ def test_parse_bbg_time():
     assert parse_bbg_time("Aft-mkt") == "AMC"
     assert parse_bbg_time(None) == "UNKNOWN"
     assert parse_bbg_time("08:00") == ""
+
+
+def test_yahoo_adapter_parses_download_without_network(cfg, members, monkeypatch):
+    """yfinance is replaced by a stub: checks column mapping, chunking and the VT fallback warning."""
+    import sys
+    import types
+    from screener.data.yahoo import YahooAdapter
+    calls = []
+
+    def download(symbols, start, end, **kw):
+        calls.append(list(symbols))
+        idx = pd.date_range(start, periods=3, freq="B")
+        fields = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+        cols = pd.MultiIndex.from_product([symbols, fields])
+        return pd.DataFrame(1.0, index=idx, columns=cols)
+
+    monkeypatch.setitem(sys.modules, "yfinance", types.SimpleNamespace(download=download))
+    ya = YahooAdapter(cfg)
+    ya.CHUNK = 2
+    out = ya.get_prices(members, list(members.index[:5]), "2025-10-27", "2025-10-31")
+    assert len(out) == 5 and len(calls) == 3
+    assert list(out["AAA US Equity"].columns) == ["open", "high", "low", "close", "adj_close", "volume"]
+    b = ya.get_benchmark("2025-10-27", "2025-10-31")
+    assert b.name == "VT" and "FALLBACK" in b.warning

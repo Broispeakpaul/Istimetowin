@@ -748,3 +748,8 @@ a/C:\Users\Lam Wing Ming\algo_trading_signal\trading_signal\strategy.py → b/C:
  - `AVOID`: failed safety filters such as price, liquidity, or volatility.
  - cd "C:/Users/Lam Wing Ming/algo_trading_signal"
 python run_scanner.py --tickers JPM XOM CVX CAT DE UNH KO WMT IBM --period 5y --backtest
+
+
+## BGTC 2026 earnings catalyst platform
+
+Decision-support screener for the Bloomberg Global Trading Challenge 2026 (recommendations only, no order placement): see [`bgtc_platform/README.md`](bgtc_platform/README.md) and the design Q&A in [`bgtc_platform/docs/DESIGN.md`](bgtc_platform/docs/DESIGN.md).
