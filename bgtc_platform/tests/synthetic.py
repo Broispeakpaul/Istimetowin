@@ -38,3 +38,24 @@ def market(cfg, members, prices, earnings=None, bench=None, vix=None, fx=None, m
                         fx=fx, earnings=pd.DataFrame(earnings or [], columns=["bbg_ticker", "report_date", "timing", "report_time_local", "source"]),
                         implied_moves=implied)
     return MarketData.load(src, members, man or manual(), cfg, START, END, tickers=list(prices))
+
+
+D1 = pd.Timestamp("2025-10-30")        # Thursday; day one for an AMC report on 29 Oct
+REPORT = pd.Timestamp("2025-10-29")
+
+
+def stock(ret_d1=0.10, vol_mult=3.0, price=100.0, volume=1_000_000.0, range_pct=0.02, d1=D1, code="XNYS",
+          extra_shocks=None, daily_ret=0.0):
+    s = sessions(code)
+    shocks = {d1: (ret_d1, vol_mult)} if d1 is not None else {}
+    shocks.update(extra_shocks or {})
+    return make_ohlcv(s, start_price=price, daily_ret=daily_ret, range_pct=range_pct, volume=volume, shocks=shocks)
+
+
+def amc(ticker, report=REPORT, timing="AMC"):
+    return {"bbg_ticker": ticker, "report_date": report, "timing": timing, "report_time_local": "16:05", "source": "test"}
+
+
+def ledger(rows, account=None):
+    from screener.inputs import Ledger
+    return Ledger.from_frame(pd.DataFrame(rows), pd.DataFrame(account) if account else None)
