@@ -1,26 +1,39 @@
 //@version=6
 strategy("Five-Filter Long Strategy", shorttitle="5F Long", overlay=true,
-     pyramiding=0, process_orders_on_close=true, calc_on_every_tick=false,
+     pyramiding=0, process_orders_on_close=false, calc_on_every_tick=false,
+     commission_type=strategy.commission.percent, commission_value=0.05, slippage=2,
      default_qty_type=strategy.percent_of_equity, default_qty_value=100,
      initial_capital=100000, max_labels_count=500, max_boxes_count=100)
 
 // =====================================================================
-//  Long-only strategy, built for a 30-MINUTE chart. A long entry fires on
-//  a CONFIRMED bar close only when ALL five filters pass on that bar:
-//    1) Volatility   2) Liquidity (daily volume)   3) Momentum
-//    4) Support downside   5) Risk-to-reward
-//  Chart extras: support/resistance zones, a linear-regression trend line
-//  with a confidence band, and a pass/fail table.
-//  Daily figures (average daily volume, daily ATR) come from ONE
-//  request.security() call on completed daily bars ([1] + lookahead_on =
-//  yesterday's final values), so nothing from an unfinished day leaks back.
+//  Long-only swing strategy for a 15-MINUTE chart. Trades are held for at
+//  most `holdDays` trading days (default 15 = 3 weeks, hard max 21 = ~1
+//  month). A long fires on a CONFIRMED bar close only when ALL five
+//  filters pass:
+//    1) Volatility   2) Liquidity (daily volume)   3) Momentum (EMAs + drift)
+//    4) Support      5) Probability model (stop, target, expected value)
+//
+//  Probability model (filter 5):
+//   - NORMAL: daily log returns ~ N(mu, sigma^2). A closed-form
+//     double-barrier solution gives P(target first), P(stop first) and
+//     P(neither before the time stop), the expected value of a time exit
+//     and the expected days in the trade.
+//     mu = Bayesian (normal-normal) shrinkage of the measured daily drift.
+//   - POISSON: rate of large daily drops -> chance of a gap through the
+//     stop while in the trade, charged as an expected-loss haircut.
+//   - BERNOULLI: every closed trade is a target-hit / no-hit trial;
+//     observed hits vs predicted probabilities recalibrate the model.
+//  Orders fill at the NEXT bar's open. Commission 0.05% per side and 2
+//  ticks slippage are set above (Settings > Properties).
+//  Daily figures come from completed daily bars ([1] + lookahead_on), so
+//  nothing from an unfinished day leaks into history.
 // =====================================================================
 
 // ---------------------------- INPUTS ---------------------------------
 // 1) Volatility
 grpVol    = "1 | Volatility"
-volMode   = input.string("Daily ATR % (prev day)", "Volatility measure", options=["Daily ATR % (prev day)", "Chart ATR % of close", "Bollinger width %"], group=grpVol, tooltip="Daily ATR % = yesterday's daily ATR / close * 100 (best on a 30m chart). Chart ATR % = ATR of the chart bars / close * 100. Bollinger width % = (upper - lower) / basis * 100 on chart bars.")
-volLen    = input.int(14, "Volatility length (ATR / BB)", minval=2, group=grpVol, tooltip="Also the length of the chart ATR used by the ATR stop and the zone height.")
+volMode   = input.string("Daily ATR % (prev day)", "Volatility measure", options=["Daily ATR % (prev day)", "Chart ATR % of close", "Bollinger width %"], group=grpVol, tooltip="Daily ATR % = yesterday's daily ATR / close * 100. Chart ATR % and Bollinger width % use the 15m bars.")
+volLen    = input.int(14, "Volatility length (ATR / BB)", minval=2, group=grpVol)
 bbMult    = input.float(2.0, "Bollinger multiplier", minval=0.1, step=0.1, group=grpVol)
 volMin    = input.float(2.0, "Min volatility (%)", minval=0.0, step=0.1, group=grpVol)
 
@@ -28,63 +41,77 @@ volMin    = input.float(2.0, "Min volatility (%)", minval=0.0, step=0.1, group=g
 grpLiq    = "2 | Liquidity (daily volume)"
 advLen    = input.int(20, "Average daily volume length (days)", minval=2, group=grpLiq)
 minAdv    = input.float(1000000, "Min average daily volume (shares)", minval=0, step=100000, group=grpLiq)
-rvolMin   = input.float(1.0, "Min relative volume (x normal)", minval=0.0, step=0.1, group=grpLiq, tooltip="Today's volume so far divided by the average volume traded by the same time of day over the last N days. Must be ABOVE this (1.0 = today is running heavier than a normal day).")
+rvolMin   = input.float(1.0, "Min relative volume (x normal)", minval=0.0, step=0.1, group=grpLiq, tooltip="Today's volume so far / average volume by the same time of day over the last N days. Must be ABOVE this.")
 
 // 3) Momentum
 grpMom     = "3 | Momentum"
-emaFastLen = input.int(9, "Fast EMA length", minval=1, group=grpMom)
-emaSlowLen = input.int(21, "Slow EMA length", minval=2, group=grpMom)
-rsiLen     = input.int(14, "RSI length", minval=2, group=grpMom)
-rsiMin     = input.float(55, "RSI threshold", minval=0, maxval=100, step=1, group=grpMom)
-rsiRiseMin = input.float(0.5, "Min RSI rise per bar", minval=0.0, step=0.1, group=grpMom, tooltip="RSI must rise by MORE than this since the prior bar. 0 = merely rising; higher = stricter 'accelerating, not flat'.")
-reqAccel   = input.bool(true, "Require widening EMA spread", group=grpMom, tooltip="Fast-minus-slow EMA spread must be larger than on the previous bar (momentum accelerating).")
-regGate    = input.bool(false, "Also require significant regression up-trend", group=grpMom, tooltip="When on, the linear-regression slope must be positive AND statistically significant at the chosen confidence level.")
+emaFastLen = input.int(20, "Fast EMA length (bars)", minval=1, group=grpMom, tooltip="20 x 15m = ~1 regular session.")
+emaSlowLen = input.int(50, "Slow EMA length (bars)", minval=2, group=grpMom)
+reqAccel   = input.bool(true, "Require widening EMA spread", group=grpMom, tooltip="Fast-minus-slow EMA spread larger than on the previous bar (accelerating, not flat). The model's daily drift must also be positive.")
 
-// 4) Support downside
+// 4) Support
 grpSup    = "4 | Support"
-swingLen  = input.int(20, "Swing-low lookback (bars)", minval=2, group=grpSup)
-maxDist   = input.float(3.0, "Max distance above support (%)", minval=0.1, step=0.1, group=grpSup)
-useSwing  = input.bool(true, "Use swing low", group=grpSup)
-useEma    = input.bool(true, "Use slow EMA (if below price)", group=grpSup)
-usePivot  = input.bool(true, "Use prior pivot low", group=grpSup)
-pivL      = input.int(5, "Pivot bars left", minval=1, group=grpSup)
-pivR      = input.int(5, "Pivot bars right (confirmation delay)", minval=1, group=grpSup)
+swingLen  = input.int(78, "Swing-low lookback (bars)", minval=2, group=grpSup, tooltip="78 x 15m = ~3 regular sessions.")
+maxSupSig = input.float(1.5, "Max distance above support (x daily sigma)", minval=0.1, step=0.1, group=grpSup, tooltip="(close - support) / close / daily volatility. 1.5 = within 1.5 normal days' moves of support.")
+usePivot  = input.bool(true, "Use prior pivot lows", group=grpSup)
+pivStr    = input.int(13, "Pivot strength (bars each side)", minval=1, group=grpSup, tooltip="13 x 15m = half a session. Pivots confirm this many bars late (no repainting).")
 pivMem    = input.int(10, "Pivots remembered", minval=1, maxval=50, group=grpSup)
 
-// 5) Stop / target / risk-to-reward
-grpRR     = "5 | Stop, target, risk-to-reward"
-stopMode  = input.string("Tighter of both", "Stop method", options=["Swing low", "ATR", "Tighter of both"], group=grpRR, tooltip="Swing low = just below the swing low. ATR = entry - ATR multiple. Tighter of both = whichever stop is closer to entry.")
-stopBuf   = input.float(0.1, "Swing-stop buffer (x ATR below swing low)", minval=0.0, step=0.05, group=grpRR)
-atrMult   = input.float(2.0, "ATR stop multiple", minval=0.1, step=0.1, group=grpRR)
-tpMode    = input.string("Risk multiple", "Take-profit method", options=["Risk multiple", "Prior pivot high"], group=grpRR, tooltip="Risk multiple = entry + multiple x risk. Prior pivot high = nearest confirmed pivot high above entry (no signal if none exists).")
-tpMultIn  = input.float(2.6, "Take-profit multiple (x risk)", minval=0.1, step=0.1, group=grpRR, tooltip="Never used below the minimum R:R, so the target can't undercut the filter.")
-minRR     = input.float(2.6, "Min reward / risk", minval=0.1, step=0.1, group=grpRR)
+// 5) Probability model
+grpMod    = "5 | Probability model"
+holdDays  = input.int(15, "Max holding period (trading days)", minval=3, maxval=21, group=grpMod, tooltip="Time stop and model horizon. 10 = 2 weeks, 15 = 3 weeks, 21 = ~1 month (max).")
+volDays   = input.int(30, "Volatility lookback (days)", minval=10, group=grpMod)
+driftDays = input.int(60, "Drift lookback (days)", minval=10, group=grpMod)
+tauPct    = input.float(0.15, "Prior drift std (% per day)", minval=0.01, step=0.01, group=grpMod, tooltip="How much true daily drift momentum can plausibly carry. Smaller = the measured trend is shrunk harder toward zero.")
+minPwin   = input.float(0.28, "Target probability P(TP)", minval=0.05, maxval=0.95, step=0.01, group=grpMod, tooltip="The target is placed as far as possible while P(hit target before stop and time stop) stays at least this. 0.28 = break-even win rate of a 2.6R trade.")
+reqPwin   = input.bool(false, "Also require P(TP) >= target probability", group=grpMod, tooltip="Off: expected value decides. On: also reject trades whose target is less likely than the setting above.")
+minRR     = input.float(2.6, "Min reward / risk", minval=0.5, step=0.1, group=grpMod)
+maxRR     = input.float(5.0, "Max reward / risk", minval=0.5, step=0.1, group=grpMod)
+minEV     = input.float(0.05, "Min expected value (R)", step=0.01, group=grpMod, tooltip="Expected profit per trade in units of the risk, after costs and gap risk.")
+costPct   = input.float(0.15, "Round-trip cost in model (%)", minval=0.0, step=0.01, group=grpMod, tooltip="Commission both sides + slippage. Keep in line with Settings > Properties.")
+capAtRes  = input.bool(true, "Cap target at nearest resistance zone", group=grpMod)
 
-// Support / resistance zones (display)
+// Stop loss
+grpStop    = "Stop loss"
+slBufSig   = input.float(0.25, "Buffer below support (x daily sigma)", minval=0.0, step=0.05, group=grpStop)
+minStopSig = input.float(1.5, "Min stop distance (x daily sigma)", minval=0.1, step=0.1, group=grpStop, tooltip="A multi-week trade should not be stopped out by one or two normal days of noise.")
+
+// Gap risk (Poisson)
+grpJump   = "Gap risk (Poisson)"
+jumpK     = input.float(3.0, "Large drop = daily return below (x sigma)", minval=1.5, step=0.5, group=grpJump)
+jumpDays  = input.int(250, "Large-drop lookback (days)", minval=50, group=grpJump)
+maxJumpP  = input.float(0.35, "Max P(>=1 large drop during max hold)", minval=0.0, maxval=1.0, step=0.05, group=grpJump)
+
+// Calibration (Bernoulli)
+grpCal    = "Calibration (Bernoulli)"
+useCal    = input.bool(true, "Recalibrate with closed trades", group=grpCal)
+calK      = input.float(5.0, "Prior strength (pseudo hits)", minval=0.5, step=0.5, group=grpCal, tooltip="Multiplier = (target hits + k) / (predicted hits + k). Larger k = slower to trust a few trades.")
+
+// Support / resistance zones
 grpZone      = "Support / resistance zones"
 showZones    = input.bool(true, "Show support / resistance zones", group=grpZone)
-zoneStr      = input.int(8, "Zone pivot strength (bars each side)", minval=2, group=grpZone, tooltip="A swing high/low must stand out from this many bars on each side. Zones appear only once confirmed (this many bars late), so they never repaint.")
-zoneAtrMult  = input.float(0.25, "Zone half-height (x chart ATR)", minval=0.05, step=0.05, group=grpZone)
+zoneStr      = input.int(26, "Zone pivot strength (bars each side)", minval=2, group=grpZone, tooltip="26 x 15m = one regular session. Zones appear once confirmed (this many bars late).")
+zoneAtrMult  = input.float(1.0, "Zone half-height (x chart ATR)", minval=0.05, step=0.05, group=grpZone)
 zonesPerSide = input.int(3, "Zones shown per side", minval=1, maxval=10, group=grpZone)
 zoneMem      = input.int(30, "Zones remembered", minval=5, maxval=100, group=grpZone)
 supCol       = input.color(color.green, "Support color", group=grpZone)
 resCol       = input.color(color.red, "Resistance color", group=grpZone)
 
-// Linear regression (display, optional momentum gate above)
-grpReg    = "Linear regression"
+// Linear regression (display)
+grpReg    = "Linear regression (display)"
 showReg   = input.bool(true, "Show regression line + confidence band", group=grpReg)
-regLen    = input.int(50, "Regression length (bars)", minval=10, maxval=500, group=grpReg)
+regLen    = input.int(100, "Regression length (bars)", minval=10, maxval=500, group=grpReg)
 confLvl   = input.string("95%", "Confidence level", options=["90%", "95%", "99%"], group=grpReg)
-showPI    = input.bool(true, "Show prediction band (dashed)", group=grpReg, tooltip="Shaded band = confidence interval of the trend line itself. Dashed lines = prediction interval, where individual closes are expected to fall.")
+showPI    = input.bool(true, "Show prediction band (dashed)", group=grpReg, tooltip="Bands are widened for autocorrelated residuals (effective sample size).")
 
 // Sizing & display
 grpMisc   = "Sizing & display"
-riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval=0.01, maxval=100, step=0.25, group=grpMisc, tooltip="Shares = equity x risk% / (entry - stop), capped at 100% of equity, rounded down to whole shares.")
-showTable = input.bool(true, "Show filter pass/fail table", group=grpMisc)
-showNear  = input.bool(false, "Label bars where exactly one filter fails", group=grpMisc)
+riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval=0.01, maxval=100, step=0.25, group=grpMisc, tooltip="Shares = equity x risk% / (entry - stop), capped at 100% of equity, whole shares.")
+coolBars  = input.int(26, "Cooldown after an exit (bars)", minval=0, group=grpMisc)
+showTable = input.bool(true, "Show filter table", group=grpMisc)
+showNear  = input.bool(false, "Label bars where filters 1-4 pass but the model rejects", group=grpMisc)
 
 // ---------------------------- TYPES & HELPERS ------------------------
-// One S/R zone built from clustered swing highs/lows.
 type Zone
     float top
     float bot
@@ -92,17 +119,8 @@ type Zone
     int   lastBar
     int   touches
 
-// Cumulative volume at each bar of one past day (for time-of-day RVOL).
 type DayCum
     array<float> cum
-
-// Nearest stored level strictly above / at-or-below a reference price.
-nearestAbove(array<float> arr, float ref) =>
-    float best = na
-    for v in arr
-        if v > ref and (na(best) or v < best)
-            best := v
-    best
 
 nearestBelow(array<float> arr, float ref) =>
     float best = na
@@ -111,11 +129,10 @@ nearestBelow(array<float> arr, float ref) =>
             best := v
     best
 
-// Tick rounding that never shrinks risk or reward (keeps R:R >= target).
+// Tick rounding that never shrinks risk or reward.
 roundDown(float x) => math.floor(x / syminfo.mintick + 1e-9) * syminfo.mintick
 roundUp(float x)   => math.ceil(x / syminfo.mintick - 1e-9) * syminfo.mintick
 
-// Average cumulative volume at bar-of-day `slot` across the stored past days.
 expectedCumAt(array<DayCum> days, int slot) =>
     float sum = 0.0
     int cnt = 0
@@ -125,8 +142,6 @@ expectedCumAt(array<DayCum> days, int slot) =>
             cnt += 1
     cnt > 0 ? sum / cnt : na
 
-// Add a confirmed swing price to the zone list: merge into an overlapping
-// zone (touch count +1) or start a new one; drop the stalest when full.
 addPivot(array<Zone> zs, float p, int pBar, float halfW, int maxZ) =>
     bool merged = false
     for z in zs
@@ -150,7 +165,6 @@ addPivot(array<Zone> zs, float p, int pBar, float halfW, int maxZ) =>
             zs.remove(stale)
     merged
 
-// Up to n zones entirely below (support) or above (resistance) price, nearest first.
 nearestZones(array<Zone> zs, float px, bool below, int n) =>
     array<Zone> out  = array.new<Zone>()
     array<Zone> pool = zs.copy()
@@ -170,48 +184,138 @@ nearestZones(array<Zone> zs, float px, bool below, int n) =>
 drawZone(Zone z, color c, string tag) =>
     box.new(math.max(z.firstBar, bar_index - 4999), z.top, bar_index + 5, z.bot, border_color=color.new(c, 40), bgcolor=color.new(c, 85), extend=extend.right, text=tag + " x" + str.tostring(z.touches), text_color=c, text_size=size.tiny, text_halign=text.align_right, text_valign=text.align_center)
 
-// ---------------------------- INDICATORS -----------------------------
-atr        = ta.atr(volLen)
-bbBasis    = ta.sma(close, volLen)
-bbDev      = ta.stdev(close, volLen)
-emaFast    = ta.ema(close, emaFastLen)
-emaSlow    = ta.ema(close, emaSlowLen)
-rsi        = ta.rsi(close, rsiLen)
-swingLow   = ta.lowest(low, swingLen)
-pivLowNew  = ta.pivotlow(low, pivL, pivR)     // value is confirmed pivR bars late: no look-ahead
-pivHighNew = ta.pivothigh(high, pivL, pivR)
-zPivHigh   = ta.pivothigh(high, zoneStr, zoneStr)
-zPivLow    = ta.pivotlow(low, zoneStr, zoneStr)
+// Standard normal CDF (Hart / West double-precision algorithm).
+cnorm(float x) =>
+    float xa = math.abs(x)
+    float c  = 0.0
+    if xa <= 37
+        float e = math.exp(-xa * xa / 2)
+        if xa < 7.07106781186547
+            float n1 = 0.0352624965998911 * xa + 0.700383064443688
+            n1 := n1 * xa + 6.37396220353165
+            n1 := n1 * xa + 33.912866078383
+            n1 := n1 * xa + 112.079291497871
+            n1 := n1 * xa + 221.213596169931
+            n1 := n1 * xa + 220.206867912376
+            float d1 = 0.0883883476483184 * xa + 1.75566716318264
+            d1 := d1 * xa + 16.064177579207
+            d1 := d1 * xa + 86.7807322029461
+            d1 := d1 * xa + 296.564248779674
+            d1 := d1 * xa + 637.333633378831
+            d1 := d1 * xa + 793.826512519948
+            d1 := d1 * xa + 440.413735824752
+            c := e * n1 / d1
+        else
+            float b1 = xa + 0.65
+            b1 := xa + 4 / b1
+            b1 := xa + 3 / b1
+            b1 := xa + 2 / b1
+            b1 := xa + 1 / b1
+            c := e / b1 / 2.506628274631
+    x > 0 ? 1 - c : c
 
-var array<float> pivLows  = array.new<float>()
-var array<float> pivHighs = array.new<float>()
+// One method-of-images term for Brownian motion with drift between two
+// absorbing barriers (log space). Evaluated as exp(E + log(D)) so a huge
+// exponent never overflows.
+jgen(float c, float psi, float th, float y0, float w, float s) =>
+    float cp = c + psi * s * s
+    float al = -cp / s
+    float be = (w - cp) / s
+    float d  = al > 0 ? cnorm(-al) - cnorm(-be) : cnorm(be) - cnorm(al)
+    d > 0 ? math.exp(psi * (c - y0) + (psi * psi - th * th) * s * s / 2 + math.log(d)) : 0.0
+
+imageSum(float psi, float th, float y0, float w, float s, int K) =>
+    float tot = 0.0
+    for k = -K to K
+        tot += jgen(y0 + 2 * k * w, psi, th, y0, w, s) - jgen(2 * k * w - y0, psi, th, y0, w, s)
+    tot
+
+thetaOf(float mu, float sig, float w) =>
+    float th = mu / (sig * sig)
+    math.abs(th * w) < 1e-5 ? 1e-5 / w : th
+
+termsK(float s, float w) => math.min(30, math.ceil(3 * s / w) + 2)
+
+// P(price reaches +a before -b within T days), log returns ~ N(mu, sig^2) per day.
+probUp(float a, float b, float mu, float sig, float T) =>
+    float w    = a + b
+    float s    = sig * math.sqrt(T)
+    float th   = thetaOf(mu, sig, w)
+    int   K    = termsK(s, w)
+    float surv = imageSum(th, th, b, w, s, K)
+    float eExp = math.exp(-2 * th * b) * imageSum(-th, th, b, w, s, K)
+    float den  = 1 - math.exp(-2 * th * w)
+    (1 - math.exp(-2 * th * b)) / den - (surv - eExp) / den
+
+// Full model: [P(target), P(stop), P(time exit), E[exp(X_T); time exit], expected days in trade]
+barrierModel(float a, float b, float mu, float sig, float T) =>
+    float w    = a + b
+    float s    = sig * math.sqrt(T)
+    float th   = thetaOf(mu, sig, w)
+    int   K    = termsK(s, w)
+    float surv = imageSum(th, th, b, w, s, K)
+    float eExp = math.exp(-2 * th * b) * imageSum(-th, th, b, w, s, K)
+    float eX   = imageSum(th + 1, th, b, w, s, K)
+    float den  = 1 - math.exp(-2 * th * w)
+    float pU   = math.max(0.0, (1 - math.exp(-2 * th * b)) / den - (surv - eExp) / den)
+    float pL   = math.max(0.0, 1 - surv - pU)
+    float acc  = 0.5
+    for j = 1 to 8
+        float sj = sig * math.sqrt(T * j / 8)
+        acc += (j == 8 ? 0.5 : 1.0) * imageSum(th, th, b, w, sj, termsK(sj, w))
+    [pU, pL, surv, eX, acc * T / 8]
+
+// Student-t critical value from the normal one (Cornish-Fisher).
+tCritFn(float z, float df) => z + (math.pow(z, 3) + z) / (4 * df) + (5 * math.pow(z, 5) + 16 * math.pow(z, 3) + 3 * z) / (96 * df * df)
+
+pctStr(float x) => str.tostring(x * 100, "#.#") + "%"
+signStr(float x, string fmt) => (x >= 0 ? "+" : "") + str.tostring(x, fmt)
+
+// ---------------------------- INDICATORS -----------------------------
+atr       = ta.atr(volLen)
+bbBasis   = ta.sma(close, volLen)
+bbDev     = ta.stdev(close, volLen)
+emaFast   = ta.ema(close, emaFastLen)
+emaSlow   = ta.ema(close, emaSlowLen)
+swingLow  = ta.lowest(low, swingLen)
+pivLowNew = ta.pivotlow(low, pivStr, pivStr)
+zPivHigh  = ta.pivothigh(high, zoneStr, zoneStr)
+zPivLow   = ta.pivotlow(low, zoneStr, zoneStr)
+newDay    = timeframe.change("1D")
+max_bars_back(close, 600)
+
+var array<float> pivLows = array.new<float>()
 if not na(pivLowNew)
     pivLows.push(pivLowNew)
     if pivLows.size() > pivMem
         pivLows.shift()
-if not na(pivHighNew)
-    pivHighs.push(pivHighNew)
-    if pivHighs.size() > pivMem
-        pivHighs.shift()
 
-// Support / resistance zones from confirmed swings.
 var array<Zone> zones = array.new<Zone>()
 if not na(zPivHigh) and not na(atr)
     addPivot(zones, zPivHigh, bar_index - zoneStr, zoneAtrMult * atr, zoneMem)
 if not na(zPivLow) and not na(atr)
     addPivot(zones, zPivLow, bar_index - zoneStr, zoneAtrMult * atr, zoneMem)
 
-// Daily data. request.security() is required: official daily volume and the
-// daily ATR cannot be rebuilt reliably from 30-minute bars. [1] with
-// lookahead_on returns the last COMPLETED day's values (no repainting).
-[advD, dAtrPct] = request.security(syminfo.tickerid, "1D", [ta.sma(volume, advLen)[1], ta.atr(volLen)[1] / close[1] * 100], lookahead=barmerge.lookahead_on)
+// Daily statistics. request.security() is required: daily volatility,
+// drift, large-drop counts and official daily volume can't be rebuilt
+// reliably from 15m bars. Every value is from the last COMPLETED day.
+dailyStats() =>
+    float r     = math.log(close / close[1])
+    float sd    = ta.stdev(r, volDays)
+    float mu    = ta.sma(r, driftDays)
+    bool  dn    = r < -jumpK * sd[1]
+    float nDn   = math.sum(dn ? 1.0 : 0.0, jumpDays)
+    float sumDn = math.sum(dn ? -r : 0.0, jumpDays)
+    float adv   = ta.sma(volume, advLen)
+    float atrP  = ta.atr(volLen) / close * 100
+    [sd[1], mu[1], nDn[1], sumDn[1], adv[1], atrP[1]]
 
-// Time-of-day relative volume, built from the chart's own bars:
-// today's cumulative volume vs the average cumulative volume at the same
-// bar of the day over the last advLen days.
+[dSig, dMu, dJumpN, dJumpSum, advD, dAtrPct] = request.security(syminfo.tickerid, "1D", dailyStats(), lookahead=barmerge.lookahead_on)
+
+// Time-of-day relative volume from the chart's own bars.
 var array<DayCum> pastDays = array.new<DayCum>()
 var array<float>  todayCum = array.new<float>()
-if timeframe.change("1D") and todayCum.size() > 0
+if newDay and todayCum.size() > 0
     pastDays.push(DayCum.new(todayCum.copy()))
     if pastDays.size() > advLen
         pastDays.shift()
@@ -221,135 +325,219 @@ todayCum.push(volToday)
 expectedCum = expectedCumAt(pastDays, todayCum.size() - 1)
 rvol        = expectedCum > 0 ? volToday / expectedCum : na
 
-// Linear regression over the last regLen closes (least squares).
-float nF    = regLen
-regEnd      = ta.linreg(close, regLen, 0)
-regStart    = ta.linreg(close, regLen, regLen - 1)
-regSlope    = (regEnd - regStart) / (nF - 1)
-regR        = ta.correlation(close, bar_index, regLen)
-regSd       = ta.stdev(close, regLen)
-regR2       = regR * regR
-regSxx      = nF * (nF * nF - 1) / 12
-regXMid     = (nF - 1) / 2
-regS        = math.sqrt(math.max(nF * regSd * regSd * (1 - regR2), 0) / (nF - 2))   // residual std error
-regSeSlope  = regS / math.sqrt(regSxx)
-regT        = regSeSlope > 0 ? regSlope / regSeSlope : na
-zCrit       = confLvl == "90%" ? 1.645 : confLvl == "95%" ? 1.96 : 2.576
-regDf       = nF - 2
-tCrit       = zCrit + (math.pow(zCrit, 3) + zCrit) / (4 * regDf) + (5 * math.pow(zCrit, 5) + 16 * math.pow(zCrit, 3) + 3 * zCrit) / (96 * regDf * regDf)   // Student-t critical value (Cornish-Fisher)
-trendUp     = regT > tCrit
-trendDn     = regT < -tCrit
-regSlopePct = regSlope / close * 100
+// Linear regression (display only).
+float nF   = regLen
+regEnd     = ta.linreg(close, regLen, 0)
+regStart   = ta.linreg(close, regLen, regLen - 1)
+regSlope   = (regEnd - regStart) / (nF - 1)
+regR       = ta.correlation(close, bar_index, regLen)
+regSd      = ta.stdev(close, regLen)
+regR2      = regR * regR
+regSxx     = nF * (nF * nF - 1) / 12
+regXMid    = (nF - 1) / 2
+regS       = math.sqrt(math.max(nF * regSd * regSd * (1 - regR2), 0) / (nF - 2))
+regSeSlope = regS / math.sqrt(regSxx)
+zCrit      = confLvl == "90%" ? 1.645 : confLvl == "95%" ? 1.96 : 2.576
+
+// ---------------------------- TRADE BOOKKEEPING ----------------------
+var float tradePRaw   = na
+var int   tpTicksV    = na
+var int   slTicksV    = na
+var int   lastClosed  = 0
+var int   lastExitBar = na
+var int   daysHeld    = 0
+var float calW = 0.0
+var float calE = 0.0
+var float calV = 0.0
+var int   calN = 0
+
+// Bernoulli calibration: a closed trade is a hit if it exited at the target.
+if strategy.closedtrades > lastClosed
+    int   ci    = strategy.closedtrades - 1
+    float ep    = strategy.closedtrades.entry_price(ci)
+    float xp    = strategy.closedtrades.exit_price(ci)
+    bool  hitTp = not na(tpTicksV) and xp >= ep + (tpTicksV - 1) * syminfo.mintick
+    if not na(tradePRaw)
+        calW += hitTp ? 1.0 : 0.0
+        calE += tradePRaw
+        calV += tradePRaw * (1 - tradePRaw)
+        calN += 1
+    lastClosed  := strategy.closedtrades
+    lastExitBar := bar_index
+calib = useCal ? math.max(0.25, math.min(2.0, (calW + calK) / (calE + calK))) : 1.0
+calZ  = calV > 0 ? (calW - calE) / math.sqrt(calV) : na
+
+// Time stop: exit at market once the maximum holding period is reached.
+if newDay and strategy.position_size > 0
+    daysHeld += 1
+if strategy.position_size > 0 and daysHeld >= holdDays
+    strategy.close("Long", comment="Time stop")
+
+// ---------------------------- MODEL INPUTS ---------------------------
+// Drift: the measured mean daily log return is noisy (standard error
+// sigma/sqrt(n)), so it is shrunk toward zero with a normal prior N(0, tau^2).
+tau     = tauPct / 100
+seMu    = dSig / math.sqrt(driftDays)
+muPost  = dMu * tau * tau / (tau * tau + seMu * seMu)
+// Poisson rate of large daily drops and their average size.
+lamDn   = dJumpN / jumpDays
+jumpAvg = dJumpN > 0 ? dJumpSum / dJumpN : 0.0
+pJump   = 1 - math.exp(-lamDn * holdDays)
 
 // ---------------------------- FILTER 1: VOLATILITY -------------------
-// Only trade when volatility is elevated: chosen measure (in %) must be
-// strictly above the minimum. Daily ATR % keeps the 2% default meaningful
-// on a 30-minute chart.
-atrPct      = atr / close * 100
-bbWidthPct  = bbBasis != 0 ? 2 * bbMult * bbDev / bbBasis * 100 : na
-volValue    = volMode == "Daily ATR % (prev day)" ? dAtrPct : volMode == "Chart ATR % of close" ? atrPct : bbWidthPct
-volOk       = not na(volValue) and volValue > volMin
+// Only trade when volatility is elevated: the chosen measure (in %) must
+// be strictly above the minimum.
+atrPct     = atr / close * 100
+bbWidthPct = bbBasis != 0 ? 2 * bbMult * bbDev / bbBasis * 100 : na
+volValue   = volMode == "Daily ATR % (prev day)" ? dAtrPct : volMode == "Chart ATR % of close" ? atrPct : bbWidthPct
+volOk      = not na(volValue) and volValue > volMin
 
 // ---------------------------- FILTER 2: LIQUIDITY (DAILY VOLUME) -----
-// Average DAILY volume over the last advLen completed days must meet the
-// minimum AND today's volume so far must be running above a normal day
-// at the same time of day (relative volume > rvolMin).
-liqOk       = advD >= minAdv and rvol > rvolMin
+// Average DAILY volume must meet the minimum AND today's volume so far
+// must be running above a normal day at the same time of day.
+liqOk = advD >= minAdv and rvol > rvolMin
 
 // ---------------------------- FILTER 3: MOMENTUM ---------------------
-// Close above a rising fast EMA, fast EMA above slow EMA, RSI above its
-// threshold and rising by more than a minimum; optionally the EMA spread
-// must be widening (accelerating, not flat) and the regression slope must
-// be a significant up-trend.
+// Close above a rising fast EMA, fast EMA above slow EMA, optionally a
+// widening EMA spread, AND a positive daily drift after shrinkage.
 emaSpread   = emaFast - emaSlow
 spreadWiden = emaSpread > emaSpread[1]
-rsiRise     = rsi - rsi[1]
-momOk       = close > emaFast and emaFast > emaFast[1] and emaFast > emaSlow and rsi > rsiMin and rsiRise > rsiRiseMin and (not reqAccel or spreadWiden) and (not regGate or trendUp)
+momOk       = close > emaFast and emaFast > emaFast[1] and emaFast > emaSlow and (not reqAccel or spreadWiden) and muPost > 0
 
-// ---------------------------- FILTER 4: SUPPORT DOWNSIDE -------------
-// Support = the NEAREST level at or below price among: swing low over the
-// lookback, slow EMA (when under price) and the closest prior pivot low.
-// Entry must sit within maxDist % above it.
-float support = na
-float supSwing = useSwing ? swingLow : na
-float supEma   = (useEma and emaSlow <= close) ? emaSlow : na
+// ---------------------------- FILTER 4: SUPPORT ----------------------
+// Support = the nearest of the swing low over the lookback and the
+// closest confirmed pivot low at or below price. Entry must sit within
+// maxSupSig daily sigmas above it.
 float supPivot = usePivot ? nearestBelow(pivLows, close) : na
-if not na(supSwing)
-    support := supSwing
-if not na(supEma) and (na(support) or supEma > support)
-    support := supEma
-if not na(supPivot) and (na(support) or supPivot > support)
+float support  = swingLow
+if not na(supPivot) and supPivot > support
     support := supPivot
-supDistPct  = support > 0 ? (close - support) / support * 100 : na
-supOk       = not na(supDistPct) and supDistPct <= maxDist
+supDistSig = dSig > 0 ? (close - support) / close / dSig : na
+supOk      = not na(supDistSig) and supDistSig <= maxSupSig
 
-// ---------------------------- FILTER 5: RISK-TO-REWARD ---------------
-// Entry = this bar's close. Stop and target are computed BEFORE entry; the
-// signal is skipped outright unless reward / risk >= minRR.
-tpMult      = math.max(tpMultIn, minRR)
-stopSwing   = swingLow - stopBuf * atr
-stopAtr     = close - atrMult * atr
-stopRaw     = stopMode == "Swing low" ? stopSwing : stopMode == "ATR" ? stopAtr : math.max(stopSwing, stopAtr)
-stopPx      = roundDown(stopRaw)
-riskPx      = close - stopPx
-tpRaw       = tpMode == "Risk multiple" ? close + tpMult * riskPx : nearestAbove(pivHighs, close)
-tpPx        = tpMode == "Risk multiple" ? roundUp(tpRaw) : tpRaw
-rewardPx    = tpPx - close
-rr          = riskPx > 0 ? rewardPx / riskPx : na
-rrOk        = not na(rr) and rr >= minRR - 1e-9
+// ---------------------------- FILTER 5: PROBABILITY MODEL ------------
+// Stop: below support by a volatility buffer, never closer than
+// minStopSig daily sigmas. Target: as far as possible while P(target
+// first) stays at the target probability (bisection), between minRR and
+// maxRR, capped at the nearest resistance zone. Then the model prices the
+// trade: EV = P(TP)*gain + P(SL)*loss + E[time exit] - costs - gap risk.
+stopFrac = dSig > 0 ? math.max((close - (support - slBufSig * dSig * close)) / close, minStopSig * dSig) : na
+stopPx   = roundDown(close * (1 - stopFrac))
+riskFrac = (close - stopPx) / close
+
+preOk   = volOk and liqOk and momOk and supOk
+flatNow = strategy.position_size == 0
+coolOk  = na(lastExitBar) or bar_index - lastExitBar > coolBars
+doModel = (barstate.isconfirmed and flatNow and preOk and coolOk) or barstate.islast
+
+float mTpPx  = na
+float mRR    = na
+float mPURaw = na
+float mPU    = na
+float mPL    = na
+float mPT    = na
+float mHold  = na
+float mEVPct = na
+float mEVR   = na
+bool  probOk = false
+bool  rrOk   = false
+bool  evOk   = false
+if doModel and dSig > 0 and not na(muPost) and riskFrac > 0 and riskFrac < 1
+    float bLog    = -math.log(1 - riskFrac)
+    float pTarget = math.min(0.95, minPwin / calib)
+    float rrSel   = minRR
+    if probUp(math.log(1 + minRR * riskFrac), bLog, muPost, dSig, holdDays) >= pTarget
+        if probUp(math.log(1 + maxRR * riskFrac), bLog, muPost, dSig, holdDays) >= pTarget
+            rrSel := maxRR
+        else
+            float lo = minRR
+            float hi = maxRR
+            for it = 1 to 8
+                float mid = (lo + hi) / 2
+                if probUp(math.log(1 + mid * riskFrac), bLog, muPost, dSig, holdDays) >= pTarget
+                    lo := mid
+                else
+                    hi := mid
+            rrSel := lo
+    float tp = roundUp(close * (1 + rrSel * riskFrac))
+    if capAtRes
+        array<Zone> resNear = nearestZones(zones, close, false, 1)
+        if resNear.size() > 0
+            Zone  rz    = resNear.first()
+            float capPx = roundDown(rz.bot)
+            if capPx < tp
+                tp := capPx
+    mTpPx := tp
+    mRR   := (tp - close) / (close - stopPx)
+    if tp > close
+        [pU, pL, pS, pEx, eHold] = barrierModel(math.log(tp / close), bLog, muPost, dSig, holdDays)
+        float pShift = 0.0
+        if useCal
+            pShift := calib < 1 ? pU * (1 - calib) : -math.min(pU * (calib - 1), pL)
+        mPURaw := pU
+        mPU    := pU - pShift
+        mPL    := pL + pShift
+        mPT    := pS
+        mHold  := eHold
+        // Poisson gap risk while in the trade: a large drop overshoots the stop.
+        float overshoot = math.max(0.0, (1 - math.exp(-jumpAvg)) - riskFrac)
+        float jumpCost  = (1 - math.exp(-nz(lamDn) * eHold)) * overshoot
+        mEVPct := mPU * (tp / close - 1) + mPL * (stopPx / close - 1) + (pEx - pS) - costPct / 100 - jumpCost
+        mEVR   := mEVPct / riskFrac
+        probOk := mPU >= minPwin - 0.005
+        rrOk   := mRR >= minRR - 1e-9
+        evOk   := mEVR >= minEV
+jumpOk  = not na(pJump) and pJump <= maxJumpP
+modelOk = rrOk and evOk and jumpOk and (not reqPwin or probOk)
 
 // ---------------------------- SIGNAL & ORDERS ------------------------
-allOk    = volOk and liqOk and momOk and supOk and rrOk
-qty      = math.floor(math.min(strategy.equity * riskPct / 100 / riskPx, strategy.equity / close))
-enterNow = barstate.isconfirmed and strategy.position_size == 0 and allOk and qty >= 1
-
-var float entryPx = na
-var float slPx    = na
-var float tpLvl   = na
+qty      = math.floor(math.min(strategy.equity * riskPct / 100 / (close * riskFrac), strategy.equity / close))
+enterNow = barstate.isconfirmed and flatNow and preOk and coolOk and modelOk and qty >= 1
 
 if enterNow
-    entryPx := close
-    slPx    := stopPx
-    tpLvl   := tpPx
+    tradePRaw := mPURaw
+    tpTicksV  := math.round((mTpPx - close) / syminfo.mintick)
+    slTicksV  := math.round((close - stopPx) / syminfo.mintick)
+    daysHeld  := 0
     strategy.entry("Long", strategy.long, qty=qty)
 
-// Real TP/SL orders. Placed on the entry bar and re-issued while in the trade.
+// Real TP/SL orders in ticks from the actual fill (next bar's open), so the
+// modelled reward/risk is kept even if the open differs from this close.
 if enterNow or strategy.position_size > 0
-    strategy.exit("Exit", from_entry="Long", stop=slPx, limit=tpLvl)
+    strategy.exit("Exit", from_entry="Long", profit=tpTicksV, loss=slTicksV, comment="Bracket")
 
 // ---------------------------- CHART OUTPUT ---------------------------
-inTrade = strategy.position_size > 0 or strategy.position_size[1] > 0 or enterNow
-plot(inTrade ? entryPx : na, "Entry",  color=color.new(color.blue, 0),  linewidth=1, style=plot.style_linebr)
-plot(inTrade ? slPx : na,    "Stop",   color=color.new(color.red, 0),   linewidth=1, style=plot.style_linebr)
-plot(inTrade ? tpLvl : na,   "Target", color=color.new(color.green, 0), linewidth=1, style=plot.style_linebr)
+float lvlEntry = strategy.position_size > 0 ? strategy.position_avg_price : enterNow ? close : na
+plot(lvlEntry, "Entry", color=color.new(color.blue, 0), linewidth=1, style=plot.style_linebr)
+plot(na(lvlEntry) ? na : lvlEntry - slTicksV * syminfo.mintick, "Stop", color=color.new(color.red, 0), linewidth=1, style=plot.style_linebr)
+plot(na(lvlEntry) ? na : lvlEntry + tpTicksV * syminfo.mintick, "Target", color=color.new(color.green, 0), linewidth=1, style=plot.style_linebr)
 plot(support, "Support used", color=color.new(color.orange, 70), style=plot.style_linebr, display=display.pane)
 plot(emaFast, "Fast EMA", color=color.new(color.aqua, 40))
 plot(emaSlow, "Slow EMA", color=color.new(color.purple, 40))
 
-// Per-bar filter results in the Data Window (1 = pass, 0 = fail).
+// Data Window: per-bar filter results (1 = pass) and model outputs.
 plot(volOk ? 1 : 0, "F1 Volatility", display=display.data_window)
 plot(liqOk ? 1 : 0, "F2 Liquidity",  display=display.data_window)
 plot(momOk ? 1 : 0, "F3 Momentum",   display=display.data_window)
 plot(supOk ? 1 : 0, "F4 Support",    display=display.data_window)
-plot(rrOk ? 1 : 0,  "F5 Risk/Reward", display=display.data_window)
+plot(modelOk ? 1 : 0, "F5 Model",    display=display.data_window)
+plot(mPU, "Model P(TP)", display=display.data_window)
+plot(mEVR, "Model EV (R)", display=display.data_window)
+plot(muPost * 100, "Drift after shrinkage (%/day)", display=display.data_window)
 plot(advD, "Avg daily volume", display=display.data_window)
 plot(rvol, "Relative volume (time of day)", display=display.data_window)
 
-// Entry label with every filter's result.
+// Entry label with the model's projection.
 if enterNow
     label.new(bar_index, low,
-         "LONG  R:R " + str.tostring(rr, "#.##") + "\nSL " + str.tostring(stopPx, format.mintick) + "  TP " + str.tostring(tpPx, format.mintick) + "\nVol ✔  Liq ✔  Mom ✔  Sup ✔  R:R ✔",
+         "LONG  R:R " + str.tostring(mRR, "#.##") + "  EV " + signStr(mEVR, "#.##") + "R\nP(TP) " + pctStr(mPU) + "  P(SL) " + pctStr(mPL) + "  P(time) " + pctStr(mPT) + "\nSL " + str.tostring(stopPx, format.mintick) + "  TP " + str.tostring(mTpPx, format.mintick) + "  ~" + str.tostring(mHold, "#.#") + "d (max " + str.tostring(holdDays) + "d)",
          style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
 
-// Optional near-miss label: exactly one filter failing.
-nPass = (volOk ? 1 : 0) + (liqOk ? 1 : 0) + (momOk ? 1 : 0) + (supOk ? 1 : 0) + (rrOk ? 1 : 0)
-if showNear and barstate.isconfirmed and strategy.position_size == 0 and nPass == 4
-    failed = not volOk ? "Volatility" : not liqOk ? "Liquidity" : not momOk ? "Momentum" : not supOk ? "Support" : "R:R"
-    label.new(bar_index, high, "✘ " + failed, style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+// Optional: setups that passed filters 1-4 but were rejected by the model.
+if showNear and barstate.isconfirmed and flatNow and preOk and coolOk and not modelOk
+    label.new(bar_index, high, "✘ model: EV " + signStr(mEVR, "#.##") + "R, R:R " + str.tostring(mRR, "#.#"), style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
 
-// Support / resistance zones: nearest zones below price (support), above
-// price (resistance) and any zone price is trading inside. Redrawn on the
-// last bar from confirmed swings only.
+// Support / resistance zones (redrawn on the last bar from confirmed swings).
 var array<box> zoneBoxes = array.new<box>()
 if showZones and barstate.islast
     for b in zoneBoxes
@@ -365,14 +553,35 @@ if showZones and barstate.islast
         if z.bot <= close and z.top >= close
             zoneBoxes.push(drawZone(z, color.gray, "S/R"))
 
-// Linear regression line over the last regLen bars with a shaded
-// confidence band (where the true trend line lies) and optional dashed
-// prediction band (where single closes should fall).
+// Regression statistics on the last bar. Residuals around a price trend
+// are autocorrelated, so the effective sample size n(1-rho)/(1+rho) is
+// used to widen the bands and deflate the t-statistic.
+float regInfl  = na
+float tCritAdj = na
+float regTAdj  = na
+if barstate.islast and not na(regS)
+    float sEE   = 0.0
+    float sEE1  = 0.0
+    float ePrev = na
+    for i = 0 to regLen - 1
+        float e = close[regLen - 1 - i] - (regStart + regSlope * i)
+        sEE += e * e
+        if not na(ePrev)
+            sEE1 += e * ePrev
+        ePrev := e
+    float rho  = sEE > 0 ? math.max(0.0, sEE1 / sEE) : 0.0
+    float nEff = math.max(5.0, math.min(nF, nF * (1 - rho) / (1 + rho)))
+    regInfl  := math.sqrt(nF / nEff)
+    tCritAdj := tCritFn(zCrit, nEff - 2)
+    regTAdj  := regSeSlope > 0 ? regSlope / (regSeSlope * regInfl) : na
+trendUp = regTAdj > tCritAdj
+trendDn = regTAdj < -tCritAdj
+
 var line     regLine = na
 var polyline ciPoly  = na
 var polyline piUpper = na
 var polyline piLower = na
-if showReg and barstate.islast and not na(regS)
+if showReg and barstate.islast and not na(regInfl)
     if not na(regLine)
         regLine.delete()
     if not na(ciPoly)
@@ -388,10 +597,11 @@ if showReg and barstate.islast and not na(regS)
     array<chart.point> dnPts = array.new<chart.point>()
     array<float> ciLow = array.new<float>()
     for i = 0 to regLen - 1
-        float dx   = i - regXMid
-        float fit  = regStart + regSlope * i
-        float ciW  = tCrit * regS * math.sqrt(1.0 / nF + dx * dx / regSxx)
-        float piW  = tCrit * regS * math.sqrt(1.0 + 1.0 / nF + dx * dx / regSxx)
+        float dx  = i - regXMid
+        float fit = regStart + regSlope * i
+        float se  = regInfl * math.sqrt(1.0 / nF + dx * dx / regSxx)
+        float ciW = tCritAdj * regS * se
+        float piW = tCritAdj * regS * math.sqrt(1.0 + se * se)
         ciPts.push(chart.point.from_index(x0 + i, fit + ciW))
         ciLow.push(fit - ciW)
         upPts.push(chart.point.from_index(x0 + i, fit + piW))
@@ -404,7 +614,7 @@ if showReg and barstate.islast and not na(regS)
         piUpper := polyline.new(upPts, xloc=xloc.bar_index, line_color=color.new(regCol, 30), line_style=line.style_dashed)
         piLower := polyline.new(dnPts, xloc=xloc.bar_index, line_color=color.new(regCol, 30), line_style=line.style_dashed)
 
-// Pass/fail table (top-right). Shows the latest bar; final once that bar closes.
+// Filter table (top-right). Shows the latest bar; final once that bar closes.
 f_row(table t, int r, string name, string detail, string status, color statusBg) =>
     table.cell(t, 0, r, name,   text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
     table.cell(t, 1, r, detail, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
@@ -413,9 +623,9 @@ f_row(table t, int r, string name, string detail, string status, color statusBg)
 passTxt(bool ok) => ok ? "✔ PASS" : "✘ FAIL"
 passBg(bool ok)  => ok ? color.new(color.green, 20) : color.new(color.red, 20)
 
-tfOk = timeframe.isintraday and timeframe.multiplier == 30
+tfOk = timeframe.isintraday and timeframe.multiplier == 15
 
-var table tbl = table.new(position.top_right, 3, 9, border_width=1, border_color=color.new(color.gray, 50))
+var table tbl = table.new(position.top_right, 3, 13, border_width=1, border_color=color.new(color.gray, 50))
 if showTable and barstate.islast
     hdrBg = color.new(color.gray, 20)
     table.cell(tbl, 0, 0, "Filter", text_color=color.white, bgcolor=hdrBg)
@@ -423,11 +633,15 @@ if showTable and barstate.islast
     table.cell(tbl, 2, 0, "Status", text_color=color.white, bgcolor=hdrBg)
     f_row(tbl, 1, "1 Volatility", str.tostring(volValue, "#.##") + "% > " + str.tostring(volMin, "#.##") + "%", passTxt(volOk), passBg(volOk))
     f_row(tbl, 2, "2 Liquidity", "ADV " + str.tostring(advD, format.volume) + " >= " + str.tostring(minAdv, format.volume) + "; RVOL " + str.tostring(rvol, "#.##") + "x > " + str.tostring(rvolMin, "#.##") + "x", passTxt(liqOk), passBg(liqOk))
-    f_row(tbl, 3, "3 Momentum", "RSI " + str.tostring(rsi, "#.#") + " (>" + str.tostring(rsiMin, "#.#") + ", +" + str.tostring(rsiRise, "#.##") + ")", passTxt(momOk), passBg(momOk))
-    f_row(tbl, 4, "4 Support", str.tostring(supDistPct, "#.##") + "% above (max " + str.tostring(maxDist, "#.##") + "%)", passTxt(supOk), passBg(supOk))
-    f_row(tbl, 5, "5 Risk/Reward", "R:R " + str.tostring(rr, "#.##") + " (min " + str.tostring(minRR, "#.##") + ")", passTxt(rrOk), passBg(rrOk))
-    f_row(tbl, 6, "LinReg trend", "slope " + str.tostring(regSlopePct, "#.###") + "%/bar, R² " + str.tostring(regR2, "#.##") + ", t " + str.tostring(regT, "#.#") + " (" + confLvl + ")", trendUp ? "▲ UP" : trendDn ? "▼ DOWN" : "FLAT", trendUp ? color.new(color.teal, 20) : trendDn ? color.new(color.maroon, 20) : hdrBg)
-    f_row(tbl, 7, "Chart timeframe", timeframe.period + (tfOk ? " (30m)" : " - switch chart to 30m"), tfOk ? "OK" : "CHECK", tfOk ? hdrBg : color.new(color.orange, 20))
-    table.cell(tbl, 0, 8, "SIGNAL", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 1, 8, strategy.position_size > 0 ? "In trade" : "Flat", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 2, 8, allOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=allOk ? color.new(color.green, 20) : hdrBg)
+    f_row(tbl, 3, "3 Momentum", "EMA " + str.tostring(emaFastLen) + "/" + str.tostring(emaSlowLen) + (close > emaFast and emaFast > emaSlow ? " aligned" : " not aligned") + "; drift " + signStr(muPost * 100, "#.###") + "%/d (raw " + signStr(dMu * 100, "#.##") + ")", passTxt(momOk), passBg(momOk))
+    f_row(tbl, 4, "4 Support", str.tostring(supDistSig, "#.##") + " sigma above (max " + str.tostring(maxSupSig, "#.#") + ")", passTxt(supOk), passBg(supOk))
+    f_row(tbl, 5, "5a Stop & target", "SL -" + pctStr(riskFrac) + "  TP +" + pctStr(mTpPx / close - 1) + "  R:R " + str.tostring(mRR, "#.##") + " (min " + str.tostring(minRR, "#.#") + ")", passTxt(rrOk), passBg(rrOk))
+    f_row(tbl, 6, "5b Normal model", "P(TP) " + pctStr(mPU) + "  P(SL) " + pctStr(mPL) + "  P(time) " + pctStr(mPT) + "  ~" + str.tostring(mHold, "#.#") + "d", reqPwin ? passTxt(probOk) : "INFO", reqPwin ? passBg(probOk) : hdrBg)
+    f_row(tbl, 7, "5c Expected value", signStr(mEVR, "#.###") + "R (" + signStr(mEVPct * 100, "#.##") + "%) after costs & gaps, min " + str.tostring(minEV, "#.##") + "R", passTxt(evOk), passBg(evOk))
+    f_row(tbl, 8, "5d Gap risk (Poisson)", str.tostring(lamDn * 252, "#.#") + " large drops/yr -> " + pctStr(pJump) + " in " + str.tostring(holdDays) + "d (max " + pctStr(maxJumpP) + ")", passTxt(jumpOk), passBg(jumpOk))
+    f_row(tbl, 9, "Calibration (Bernoulli)", "TP hits " + str.tostring(calW, "#") + " vs " + str.tostring(calE, "#.#") + " expected (n=" + str.tostring(calN) + ", z " + signStr(calZ, "#.#") + ") -> x" + str.tostring(calib, "#.##"), "INFO", hdrBg)
+    f_row(tbl, 10, "LinReg trend", "slope " + str.tostring(regSlope / close * 100, "#.###") + "%/bar, R² " + str.tostring(regR2, "#.##") + ", t(adj) " + str.tostring(regTAdj, "#.#"), trendUp ? "▲ UP" : trendDn ? "▼ DOWN" : "FLAT", trendUp ? color.new(color.teal, 20) : trendDn ? color.new(color.maroon, 20) : hdrBg)
+    f_row(tbl, 11, "Chart timeframe", timeframe.period + (tfOk ? " (15m)" : " - switch chart to 15m"), tfOk ? "OK" : "CHECK", tfOk ? hdrBg : color.new(color.orange, 20))
+    table.cell(tbl, 0, 12, "SIGNAL", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 1, 12, strategy.position_size > 0 ? "In trade, day " + str.tostring(daysHeld) + " of " + str.tostring(holdDays) : "Flat", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 2, 12, preOk and modelOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=preOk and modelOk ? color.new(color.green, 20) : hdrBg)
