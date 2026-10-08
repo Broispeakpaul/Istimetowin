@@ -96,6 +96,9 @@ zonesPerSide = input.int(3, "Zones shown per side", minval=1, maxval=10, group=g
 zoneMem      = input.int(30, "Zones remembered", minval=5, maxval=100, group=grpZone)
 supCol       = input.color(color.green, "Support color", group=grpZone)
 resCol       = input.color(color.red, "Resistance color", group=grpZone)
+showZoneLbl  = input.bool(true, "Label zones (rank, price range, distance, touches)", group=grpZone)
+zoneLblSize  = input.string("small", "Zone label size", options=["tiny", "small", "normal"], group=grpZone)
+zoneLblOff   = input.int(3, "Label offset right of last bar (bars)", minval=0, maxval=100, group=grpZone)
 
 // Linear regression (display)
 grpReg    = "Linear regression (display)"
@@ -181,8 +184,9 @@ nearestZones(array<Zone> zs, float px, bool below, int n) =>
             pool.remove(bestIdx)
     out
 
-drawZone(Zone z, color c, string tag) =>
-    box.new(math.max(z.firstBar, bar_index - 4999), z.top, bar_index + 5, z.bot, border_color=color.new(c, 40), bgcolor=color.new(c, 85), extend=extend.right, text=tag + " x" + str.tostring(z.touches), text_color=c, text_size=size.tiny, text_halign=text.align_right, text_valign=text.align_center)
+// Zone box; more touches = more opaque (stronger zone).
+drawZone(Zone z, color c) =>
+    box.new(math.max(z.firstBar, bar_index - 4999), z.top, bar_index + 5, z.bot, border_color=color.new(c, 40), bgcolor=color.new(c, math.max(65, 90 - 5 * z.touches)), extend=extend.right)
 
 // Standard normal CDF (Hart / West double-precision algorithm).
 cnorm(float x) =>
@@ -270,6 +274,12 @@ tCritFn(float z, float df) => z + (math.pow(z, 3) + z) / (4 * df) + (5 * math.po
 
 pctStr(float x) => str.tostring(x * 100, "#.#") + "%"
 signStr(float x, string fmt) => (x >= 0 ? "+" : "") + str.tostring(x, fmt)
+
+// "97.20 - 98.10  (-1.8%, 3 touches)": price range, distance of the zone middle from close, swing count.
+zoneRangeTxt(Zone z) => str.tostring(z.bot, format.mintick) + " - " + str.tostring(z.top, format.mintick) + "  (" + signStr(((z.top + z.bot) / 2 / close - 1) * 100, "#.#") + "%, " + str.tostring(z.touches) + (z.touches == 1 ? " touch)" : " touches)")
+
+drawZoneLabel(Zone z, color c, string txt, int offset, string sz) =>
+    label.new(bar_index + offset, (z.top + z.bot) / 2, txt, style=label.style_label_left, color=color.new(c, 25), textcolor=color.white, size=sz, tooltip="Zone built from " + str.tostring(z.touches) + " confirmed swing high/low(s). Below price = support, above = resistance; a broken zone flips role.")
 
 // ---------------------------- INDICATORS -----------------------------
 atr       = ta.atr(volLen)
@@ -442,6 +452,7 @@ float mEVR   = na
 bool  probOk = false
 bool  rrOk   = false
 bool  evOk   = false
+bool  mCapped = false
 if doModel and dSig > 0 and not na(muPost) and riskFrac > 0 and riskFrac < 1
     float bLog    = -math.log(1 - riskFrac)
     float pTarget = math.min(0.95, minPwin / calib)
@@ -466,7 +477,8 @@ if doModel and dSig > 0 and not na(muPost) and riskFrac > 0 and riskFrac < 1
             Zone  rz    = resNear.first()
             float capPx = roundDown(rz.bot)
             if capPx < tp
-                tp := capPx
+                tp      := capPx
+                mCapped := true
     mTpPx := tp
     mRR   := (tp - close) / (close - stopPx)
     if tp > close
@@ -538,20 +550,45 @@ if showNear and barstate.isconfirmed and flatNow and preOk and coolOk and not mo
     label.new(bar_index, high, "✘ model: EV " + signStr(mEVR, "#.##") + "R, R:R " + str.tostring(mRR, "#.#"), style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
 
 // Support / resistance zones (redrawn on the last bar from confirmed swings).
-var array<box> zoneBoxes = array.new<box>()
+// Labels: rank (S1 = nearest support, R1 = nearest resistance), price
+// range, distance from price and touch count; the zone holding the
+// support used by filter 4 and the resistance capping the target are marked.
+var array<box>   zoneBoxes  = array.new<box>()
+var array<label> zoneLabels = array.new<label>()
+zLblSize = zoneLblSize == "tiny" ? size.tiny : zoneLblSize == "normal" ? size.normal : size.small
 if showZones and barstate.islast
-    for b in zoneBoxes
-        b.delete()
+    for bx in zoneBoxes
+        bx.delete()
     zoneBoxes.clear()
+    for lb in zoneLabels
+        lb.delete()
+    zoneLabels.clear()
     array<Zone> supZones = nearestZones(zones, close, true, zonesPerSide)
     array<Zone> resZones = nearestZones(zones, close, false, zonesPerSide)
-    for z in supZones
-        zoneBoxes.push(drawZone(z, supCol, "S"))
-    for z in resZones
-        zoneBoxes.push(drawZone(z, resCol, "R"))
+    array<Zone> inZones  = array.new<Zone>()
     for z in zones
         if z.bot <= close and z.top >= close
-            zoneBoxes.push(drawZone(z, color.gray, "S/R"))
+            inZones.push(z)
+    bool anchorShown = false
+    for [i, z] in supZones
+        zoneBoxes.push(drawZone(z, supCol))
+        if showZoneLbl
+            bool isAnchor = not anchorShown and support >= z.bot and support <= z.top
+            anchorShown := anchorShown or isAnchor
+            zoneLabels.push(drawZoneLabel(z, supCol, "Support S" + str.tostring(i + 1) + "  " + zoneRangeTxt(z) + (isAnchor ? "  ◄ support used" : ""), zoneLblOff, zLblSize))
+    for [i, z] in resZones
+        zoneBoxes.push(drawZone(z, resCol))
+        if showZoneLbl
+            zoneLabels.push(drawZoneLabel(z, resCol, "Resistance R" + str.tostring(i + 1) + "  " + zoneRangeTxt(z) + (i == 0 and mCapped and flatNow ? "  ◄ caps target" : ""), zoneLblOff, zLblSize))
+    for z in inZones
+        zoneBoxes.push(drawZone(z, color.gray))
+        if showZoneLbl
+            bool isAnchor = not anchorShown and support >= z.bot and support <= z.top
+            anchorShown := anchorShown or isAnchor
+            zoneLabels.push(drawZoneLabel(z, color.gray, "Price inside zone  " + zoneRangeTxt(z) + (isAnchor ? "  ◄ support used" : ""), zoneLblOff, zLblSize))
+    // Support used by filter 4 but not inside a drawn zone: label it on its own.
+    if showZoneLbl and not anchorShown and not na(support)
+        zoneLabels.push(label.new(bar_index + zoneLblOff, support, "Support used " + str.tostring(support, format.mintick) + "  (" + signStr((support / close - 1) * 100, "#.#") + "%, swing/pivot low)", style=label.style_label_left, color=color.new(color.orange, 25), textcolor=color.white, size=zLblSize))
 
 // Regression statistics on the last bar. Residuals around a price trend
 // are autocorrelated, so the effective sample size n(1-rho)/(1+rho) is
@@ -625,7 +662,7 @@ passBg(bool ok)  => ok ? color.new(color.green, 20) : color.new(color.red, 20)
 
 tfOk = timeframe.isintraday and timeframe.multiplier == 15
 
-var table tbl = table.new(position.top_right, 3, 13, border_width=1, border_color=color.new(color.gray, 50))
+var table tbl = table.new(position.top_right, 3, 14, border_width=1, border_color=color.new(color.gray, 50))
 if showTable and barstate.islast
     hdrBg = color.new(color.gray, 20)
     table.cell(tbl, 0, 0, "Filter", text_color=color.white, bgcolor=hdrBg)
@@ -635,13 +672,22 @@ if showTable and barstate.islast
     f_row(tbl, 2, "2 Liquidity", "ADV " + str.tostring(advD, format.volume) + " >= " + str.tostring(minAdv, format.volume) + "; RVOL " + str.tostring(rvol, "#.##") + "x > " + str.tostring(rvolMin, "#.##") + "x", passTxt(liqOk), passBg(liqOk))
     f_row(tbl, 3, "3 Momentum", "EMA " + str.tostring(emaFastLen) + "/" + str.tostring(emaSlowLen) + (close > emaFast and emaFast > emaSlow ? " aligned" : " not aligned") + "; drift " + signStr(muPost * 100, "#.###") + "%/d (raw " + signStr(dMu * 100, "#.##") + ")", passTxt(momOk), passBg(momOk))
     f_row(tbl, 4, "4 Support", str.tostring(supDistSig, "#.##") + " sigma above (max " + str.tostring(maxSupSig, "#.#") + ")", passTxt(supOk), passBg(supOk))
-    f_row(tbl, 5, "5a Stop & target", "SL -" + pctStr(riskFrac) + "  TP +" + pctStr(mTpPx / close - 1) + "  R:R " + str.tostring(mRR, "#.##") + " (min " + str.tostring(minRR, "#.#") + ")", passTxt(rrOk), passBg(rrOk))
-    f_row(tbl, 6, "5b Normal model", "P(TP) " + pctStr(mPU) + "  P(SL) " + pctStr(mPL) + "  P(time) " + pctStr(mPT) + "  ~" + str.tostring(mHold, "#.#") + "d", reqPwin ? passTxt(probOk) : "INFO", reqPwin ? passBg(probOk) : hdrBg)
-    f_row(tbl, 7, "5c Expected value", signStr(mEVR, "#.###") + "R (" + signStr(mEVPct * 100, "#.##") + "%) after costs & gaps, min " + str.tostring(minEV, "#.##") + "R", passTxt(evOk), passBg(evOk))
-    f_row(tbl, 8, "5d Gap risk (Poisson)", str.tostring(lamDn * 252, "#.#") + " large drops/yr -> " + pctStr(pJump) + " in " + str.tostring(holdDays) + "d (max " + pctStr(maxJumpP) + ")", passTxt(jumpOk), passBg(jumpOk))
-    f_row(tbl, 9, "Calibration (Bernoulli)", "TP hits " + str.tostring(calW, "#") + " vs " + str.tostring(calE, "#.#") + " expected (n=" + str.tostring(calN) + ", z " + signStr(calZ, "#.#") + ") -> x" + str.tostring(calib, "#.##"), "INFO", hdrBg)
-    f_row(tbl, 10, "LinReg trend", "slope " + str.tostring(regSlope / close * 100, "#.###") + "%/bar, R² " + str.tostring(regR2, "#.##") + ", t(adj) " + str.tostring(regTAdj, "#.#"), trendUp ? "▲ UP" : trendDn ? "▼ DOWN" : "FLAT", trendUp ? color.new(color.teal, 20) : trendDn ? color.new(color.maroon, 20) : hdrBg)
-    f_row(tbl, 11, "Chart timeframe", timeframe.period + (tfOk ? " (15m)" : " - switch chart to 15m"), tfOk ? "OK" : "CHECK", tfOk ? hdrBg : color.new(color.orange, 20))
-    table.cell(tbl, 0, 12, "SIGNAL", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 1, 12, strategy.position_size > 0 ? "In trade, day " + str.tostring(daysHeld) + " of " + str.tostring(holdDays) : "Flat", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 2, 12, preOk and modelOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=preOk and modelOk ? color.new(color.green, 20) : hdrBg)
+    array<Zone> s1 = nearestZones(zones, close, true, 1)
+    array<Zone> r1 = nearestZones(zones, close, false, 1)
+    string s1Txt = "none"
+    string r1Txt = "none"
+    if s1.size() > 0
+        s1Txt := zoneRangeTxt(s1.first())
+    if r1.size() > 0
+        r1Txt := zoneRangeTxt(r1.first())
+    f_row(tbl, 5, "Nearest zones", "S1 support " + s1Txt + "\nR1 resistance " + r1Txt, "INFO", hdrBg)
+    f_row(tbl, 6, "5a Stop & target", "SL -" + pctStr(riskFrac) + "  TP +" + pctStr(mTpPx / close - 1) + "  R:R " + str.tostring(mRR, "#.##") + " (min " + str.tostring(minRR, "#.#") + ")", passTxt(rrOk), passBg(rrOk))
+    f_row(tbl, 7, "5b Normal model", "P(TP) " + pctStr(mPU) + "  P(SL) " + pctStr(mPL) + "  P(time) " + pctStr(mPT) + "  ~" + str.tostring(mHold, "#.#") + "d", reqPwin ? passTxt(probOk) : "INFO", reqPwin ? passBg(probOk) : hdrBg)
+    f_row(tbl, 8, "5c Expected value", signStr(mEVR, "#.###") + "R (" + signStr(mEVPct * 100, "#.##") + "%) after costs & gaps, min " + str.tostring(minEV, "#.##") + "R", passTxt(evOk), passBg(evOk))
+    f_row(tbl, 9, "5d Gap risk (Poisson)", str.tostring(lamDn * 252, "#.#") + " large drops/yr -> " + pctStr(pJump) + " in " + str.tostring(holdDays) + "d (max " + pctStr(maxJumpP) + ")", passTxt(jumpOk), passBg(jumpOk))
+    f_row(tbl, 10, "Calibration (Bernoulli)", "TP hits " + str.tostring(calW, "#") + " vs " + str.tostring(calE, "#.#") + " expected (n=" + str.tostring(calN) + ", z " + signStr(calZ, "#.#") + ") -> x" + str.tostring(calib, "#.##"), "INFO", hdrBg)
+    f_row(tbl, 11, "LinReg trend", "slope " + str.tostring(regSlope / close * 100, "#.###") + "%/bar, R² " + str.tostring(regR2, "#.##") + ", t(adj) " + str.tostring(regTAdj, "#.#"), trendUp ? "▲ UP" : trendDn ? "▼ DOWN" : "FLAT", trendUp ? color.new(color.teal, 20) : trendDn ? color.new(color.maroon, 20) : hdrBg)
+    f_row(tbl, 12, "Chart timeframe", timeframe.period + (tfOk ? " (15m)" : " - switch chart to 15m"), tfOk ? "OK" : "CHECK", tfOk ? hdrBg : color.new(color.orange, 20))
+    table.cell(tbl, 0, 13, "SIGNAL", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 1, 13, strategy.position_size > 0 ? "In trade, day " + str.tostring(daysHeld) + " of " + str.tostring(holdDays) : "Flat", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 2, 13, preOk and modelOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=preOk and modelOk ? color.new(color.green, 20) : hdrBg)
