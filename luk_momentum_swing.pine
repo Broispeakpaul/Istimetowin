@@ -55,7 +55,7 @@ epGap    = input.float(10.0, "EP: min gap up (%)", minval=1, step=1, group=grpSe
 grpRisk  = "4 | Risk & sizing"
 riskPct  = input.float(0.5, "Risk per trade (% of equity)", minval=0.05, step=0.05, group=grpRisk)
 maxStop  = input.float(3.0, "Max stop distance (%)", minval=0.1, step=0.1, group=grpRisk, tooltip="Stop is the low of the day. If that is further than this from the entry, the trade is skipped.")
-maxPos   = input.float(100, "Max position (% of equity)", minval=1, step=5, group=grpRisk)
+maxPos   = input.float(50, "Max position (% of equity)", minval=1, step=5, group=grpRisk, tooltip="Caps the damage when a stock gaps through the stop. With 0.5% risk, stops tighter than 1% get capped and risk less than 0.5%.")
 onePer   = input.bool(true, "Max one entry per day", group=grpRisk)
 
 grpExit  = "5 | Exits"
@@ -65,6 +65,8 @@ trailLen = input.int(9, "Trail: daily EMA length", minval=2, group=grpExit)
 trailPre = input.bool(false, "Trail with the EMA before the first sale too", group=grpExit)
 beAfter  = input.bool(false, "Move stop to breakeven after first sale (my addition)", group=grpExit)
 timeStop = input.int(0, "Exit if no first sale after N days (0 = off)", minval=0, group=grpExit)
+ovnMinR  = input.float(0.0, "Before first sale, hold overnight only if open profit >= R (0 = off)", minval=0, step=0.5, group=grpExit, tooltip="Gap protection: a trade not yet showing this much profit is sold at the close instead of being carried into the next open.")
+gapFlagR = input.float(1.2, "Flag losses worse than (R) as gap/slippage losses", minval=1.0, step=0.1, group=grpExit)
 
 grpReg   = "6 | Regime (trade less when it's not working)"
 idxSym   = input.symbol("AMEX:SPY", "Index", group=grpReg)
@@ -163,13 +165,38 @@ idxOk = idxClose > idxEma
 var float peakEq = na
 peakEq := math.max(nz(peakEq, strategy.equity), strategy.equity)
 ddPct = (1 - strategy.equity / peakEq) * 100
-int nClosed    = strategy.closedtrades
-int recentCnt  = 0
+var float planStop    = na
+var float planTrig    = na
+var float entryQty    = na
+var float entryPx     = na
+var float slPx        = na
+var float tp1Px       = na
+var float riskInit    = na
+var bool  partialDone = false
+var int   daysInTrade = 0
+
+// Result of each finished position in R. The first sale and the remainder
+// are separate closed trades in TradingView, so they are added together
+// here and a position counts once. Losses below -1R show gap/slippage cost.
+var array<float> tradeR = array.new<float>()
+var int counted = 0
+if strategy.position_size == 0 and strategy.closedtrades > counted
+    float pnl = 0.0
+    float sz  = 0.0
+    for i = counted to strategy.closedtrades - 1
+        pnl += strategy.closedtrades.profit(i)
+        sz  += math.abs(strategy.closedtrades.size(i))
+    float r1 = strategy.closedtrades.entry_price(counted) - planStop
+    if r1 > 0 and sz > 0
+        tradeR.push(pnl / (sz * r1))
+    counted := strategy.closedtrades
+
+int nT         = tradeR.size()
+int recentCnt  = math.min(recentN, nT)
 int recentWins = 0
-if nClosed > 0
-    for i = math.max(0, nClosed - recentN) to nClosed - 1
-        recentCnt += 1
-        if strategy.closedtrades.profit(i) > 0
+if recentCnt > 0
+    for i = nT - recentCnt to nT - 1
+        if tradeR.get(i) > 0
             recentWins += 1
 coldStreak  = recentCnt >= recentN and recentWins < recentK
 riskMult    = (regMode == "Halve risk" and not idxOk ? 0.5 : 1.0) * (ddPct >= ddLimit ? 0.5 : 1.0) * (coldStreak ? 0.5 : 1.0)
@@ -181,15 +208,6 @@ qty = math.floor(math.min(strategy.equity * riskNow / 100 / riskPS, strategy.equ
 entryOk = barstate.isconfirmed and strategy.position_size == 0 and session.ismarket and not session.islastbar_regular and qualityOk and regimeAllow and not (onePer and enteredToday) and not na(trig) and riskPS > 0 and stopPct <= maxStop and qty >= 1
 
 // ---------------------------- ORDERS ---------------------------------
-var float planStop    = na
-var float planTrig    = na
-var float entryQty    = na
-var float entryPx     = na
-var float slPx        = na
-var float tp1Px       = na
-var float riskInit    = na
-var bool  partialDone = false
-var int   daysInTrade = 0
 
 // Buy-stop for the next bar only; re-evaluated (or cancelled) every bar.
 if entryOk
@@ -239,6 +257,8 @@ if strategy.position_size > 0 and session.islastbar_regular and not newPos
         strategy.close("Long", comment="Daily close < " + str.tostring(trailLen) + " EMA")
     else if timeStop > 0 and not partialDone and daysInTrade >= timeStop
         strategy.close("Long", comment="Time stop")
+    else if ovnMinR > 0 and not partialDone and (close - entryPx) / riskInit < ovnMinR
+        strategy.close("Long", comment="No overnight below " + str.tostring(ovnMinR, "#.#") + "R")
 
 // ---------------------------- CHART ----------------------------------
 inMkt = session.ismarket
@@ -264,7 +284,7 @@ row(table t, int r, string a, string b, string c, color bg) =>
     table.cell(t, 2, r, c, text_color=color.white, bgcolor=bg)
 
 tfOk = timeframe.isintraday and timeframe.multiplier <= 15
-var table tbl = table.new(position.top_right, 3, 9, border_width=1, border_color=color.new(color.gray, 50))
+var table tbl = table.new(position.top_right, 3, 10, border_width=1, border_color=color.new(color.gray, 50))
 if showTbl and barstate.islast
     hdr = color.new(color.gray, 20)
     row(tbl, 0, "Scanner", "price " + str.tostring(close, format.mintick) + ", ADR " + str.tostring(dAdr, "#.#") + "%, $vol " + str.tostring(dDv / 1e6, "#.#") + "M", okTxt(qualityOk), okBg(qualityOk))
@@ -275,4 +295,21 @@ if showTbl and barstate.islast
     row(tbl, 5, "Position", inPos ? str.tostring(strategy.position_size, "#") + " sh, " + str.tostring((close - entryPx) / riskInit, "#.##") + "R open, day " + str.tostring(daysInTrade) : "flat", inPos ? (partialDone ? "trailing" : "to " + str.tostring(targetR, "#.#") + "R") : "-", hdr)
     row(tbl, 6, "Trail", "daily EMA" + str.tostring(trailLen) + " today ~" + str.tostring(e9Today, format.mintick), okTxt(not trailHit), okBg(not trailHit))
     row(tbl, 7, "Chart", timeframe.period + (tfOk ? " (intraday)" : " - use a 1-15m chart"), tfOk ? "OK" : "CHECK", tfOk ? hdr : color.new(color.orange, 20))
+    int   nWin = 0
+    int   nGap = 0
+    float sWin = 0.0
+    float sLos = 0.0
+    float wrst = 0.0
+    for r in tradeR
+        if r > 0
+            nWin += 1
+            sWin += r
+        else
+            sLos += r
+            if r < -gapFlagR
+                nGap += 1
+        wrst := math.min(wrst, r)
+    float expR = nT > 0 ? (sWin + sLos) / nT : na
+    string resTxt = nT == 0 ? "no closed trades yet" : str.tostring(nT) + " trades, win " + str.tostring(nWin * 100.0 / nT, "#") + "%, avg win " + str.tostring(nWin > 0 ? sWin / nWin : 0.0, "#.#") + "R, avg loss " + str.tostring(nT > nWin ? sLos / (nT - nWin) : 0.0, "#.##") + "R, worst " + str.tostring(wrst, "#.#") + "R, " + str.tostring(nGap) + " worse than -" + str.tostring(gapFlagR, "#.#") + "R"
+    row(tbl, 9, "Results (R)", resTxt, nT == 0 ? "-" : "exp " + str.tostring(expR, "#.##") + "R", nT == 0 ? hdr : expR > 0 ? color.new(color.green, 25) : color.new(color.red, 25))
     row(tbl, 8, "Next bar", entryOk ? "buy-stop " + str.tostring(qty, "#") + " sh @ " + str.tostring(trig, format.mintick) : "no order", entryOk ? "ORDER" : "WAIT", entryOk ? color.new(color.green, 20) : hdr)
