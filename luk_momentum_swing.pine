@@ -1,0 +1,278 @@
+//@version=6
+strategy("Luk Momentum Swing (Pullback / Breakout / EP)", shorttitle="Luk Swing", overlay=true,
+     pyramiding=0, process_orders_on_close=false, calc_on_every_tick=false,
+     commission_type=strategy.commission.percent, commission_value=0.02, slippage=2,
+     initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
+     max_labels_count=500)
+
+// =====================================================================
+//  Long-only momentum swing strategy in the style described for Martin Luk
+//  (Qullamaggie school). Use an INTRADAY chart (5m recommended) with
+//  regular trading hours; daily data is pulled in for the scanner, trend,
+//  base and trailing rules.
+//
+//  1. Scanner : price, ADR% (moves enough) and average dollar volume.
+//  2. Setups  : PULLBACK  - daily uptrend, price pulled into the 10/20 EMA,
+//                           buy when a bar trades above the prior bar's high.
+//               BREAKOUT  - daily uptrend + tight base of N days, buy above
+//                           the opening-range high and/or prior-day high.
+//               EP (gap)  - gap up >= X% on the day, let the open sell off,
+//                           buy when a bar trades above the prior bar's high.
+//  3. Risk    : stop at the low of the day; skip if the stop is > 3% away;
+//               size = equity x 0.5% / (entry - stop).
+//  4. Exits   : no sale before 3R; sell a first portion at 3R, trail the rest
+//               with the DAILY 9 EMA (daily close below it -> sell next open).
+//  5. Regime  : index below its 50-day EMA, a drawdown, or a cold streak
+//               each halve the risk (or block entries).
+//  Entries are buy-stop orders placed at a bar's close for the next bar, so
+//  nothing fills at a price that was already known.
+// =====================================================================
+
+// ---------------------------- INPUTS ---------------------------------
+grpScan  = "1 | Scanner (strong, liquid, volatile)"
+minPrice = input.float(5.0, "Min price", minval=0, group=grpScan)
+adrLen   = input.int(20, "ADR length (days)", minval=2, group=grpScan)
+minAdr   = input.float(4.0, "Min ADR %", minval=0, step=0.5, group=grpScan, tooltip="Average daily range = 100 x (average of high/low - 1). A stock needs enough daily movement to reach 3R.")
+dvLen    = input.int(20, "Dollar-volume length (days)", minval=2, group=grpScan)
+minDvM   = input.float(20, "Min avg dollar volume ($ millions)", minval=0, step=5, group=grpScan)
+
+grpTrend = "2 | Daily trend (my defaults; video lists 3 daily conditions)"
+momLen   = input.int(63, "Momentum lookback (days)", minval=5, group=grpTrend, tooltip="63 days = ~3 months.")
+minMom   = input.float(30, "Min gain over lookback (%)", step=5, group=grpTrend)
+useSma50 = input.bool(true, "Require close above 50-day SMA", group=grpTrend)
+
+grpSet   = "3 | Setups"
+usePB    = input.bool(true, "Pullback", group=grpSet)
+pbTol    = input.float(1.0, "Pullback: low within % above daily 10/20 EMA", minval=0, step=0.5, group=grpSet)
+useBO    = input.bool(true, "Breakout", group=grpSet)
+consLen  = input.int(10, "Breakout: base length (days)", minval=3, group=grpSet, tooltip="Video: consolidation of at least 1-2 weeks.")
+consMax  = input.float(3.0, "Breakout: max base range (x ADR)", minval=0.5, step=0.5, group=grpSet, tooltip="High-to-low range of the base divided by ADR. Smaller = tighter base required.")
+boTrig   = input.string("Either (first to break)", "Breakout trigger", options=["Opening-range high", "Prior-day high", "Either (first to break)"], group=grpSet)
+orMin    = input.int(5, "Opening range (minutes)", minval=1, group=grpSet)
+useEP    = input.bool(true, "EP (episodic pivot gap)", group=grpSet)
+epGap    = input.float(10.0, "EP: min gap up (%)", minval=1, step=1, group=grpSet)
+
+grpRisk  = "4 | Risk & sizing"
+riskPct  = input.float(0.5, "Risk per trade (% of equity)", minval=0.05, step=0.05, group=grpRisk)
+maxStop  = input.float(3.0, "Max stop distance (%)", minval=0.1, step=0.1, group=grpRisk, tooltip="Stop is the low of the day. If that is further than this from the entry, the trade is skipped.")
+maxPos   = input.float(100, "Max position (% of equity)", minval=1, step=5, group=grpRisk)
+onePer   = input.bool(true, "Max one entry per day", group=grpRisk)
+
+grpExit  = "5 | Exits"
+targetR  = input.float(3.0, "First sale at (R)", minval=0.5, step=0.5, group=grpExit)
+partPct  = input.int(33, "First sale size (% of position)", minval=1, maxval=99, group=grpExit)
+trailLen = input.int(9, "Trail: daily EMA length", minval=2, group=grpExit)
+trailPre = input.bool(false, "Trail with the EMA before the first sale too", group=grpExit)
+beAfter  = input.bool(false, "Move stop to breakeven after first sale (my addition)", group=grpExit)
+timeStop = input.int(0, "Exit if no first sale after N days (0 = off)", minval=0, group=grpExit)
+
+grpReg   = "6 | Regime (trade less when it's not working)"
+idxSym   = input.symbol("AMEX:SPY", "Index", group=grpReg)
+idxLen   = input.int(50, "Index EMA length (days)", minval=2, group=grpReg)
+regMode  = input.string("Halve risk", "Index below its EMA", options=["Off", "Halve risk", "Block new entries"], group=grpReg)
+ddLimit  = input.float(10.0, "Halve risk when drawdown from peak >= (%)", minval=0, step=1, group=grpReg)
+recentN  = input.int(10, "Cold streak: look at last N closed trades", minval=1, group=grpReg)
+recentK  = input.int(2, "Cold streak: halve risk if fewer winners than", minval=0, group=grpReg)
+
+grpDisp  = "Display"
+showTbl  = input.bool(true, "Show status table", group=grpDisp)
+showLvl  = input.bool(true, "Show levels (LOD, ORH, prior-day high, daily EMAs)", group=grpDisp)
+
+// ---------------------------- DAILY DATA -----------------------------
+// request.security() is required for daily ADR, dollar volume, EMAs and the
+// base. [1] with lookahead_on = last COMPLETED day only (no repainting).
+dailyStats() =>
+    float adr = 100 * (ta.sma(high / low, adrLen) - 1)
+    float dv  = ta.sma(close * volume, dvLen)
+    float e9  = ta.ema(close, trailLen)
+    float e10 = ta.ema(close, 10)
+    float e20 = ta.ema(close, 20)
+    float s50 = ta.sma(close, 50)
+    float mom = 100 * (close / close[momLen] - 1)
+    float cHi = ta.highest(high, consLen)
+    float cLo = ta.lowest(low, consLen)
+    [adr[1], dv[1], e9[1], e10[1], e20[1], s50[1], mom[1], cHi[1], cLo[1], close[1], high[1], low[1]]
+
+[dAdr, dDv, dE9, dE10, dE20, dS50, dMom, dConsHi, dConsLo, dPrevClose, dPrevHigh, dPrevLow] = request.security(syminfo.tickerid, "1D", dailyStats(), lookahead=barmerge.lookahead_on)
+
+idxStats() => [close[1], ta.ema(close, idxLen)[1]]
+[idxClose, idxEma] = request.security(idxSym, "1D", idxStats(), lookahead=barmerge.lookahead_on)
+
+// ---------------------------- INTRADAY DAY TRACKING ------------------
+var float dayOpen  = na
+var float dayLow   = na
+var int   dayStart = na
+var float orHigh   = na
+var bool  enteredToday = false
+if session.isfirstbar_regular
+    dayOpen      := open
+    dayLow       := low
+    dayStart     := time
+    orHigh       := high
+    enteredToday := false
+else if session.ismarket
+    dayLow := math.min(nz(dayLow, low), low)
+    if not na(dayStart) and time < dayStart + orMin * 60000
+        orHigh := math.max(nz(orHigh, high), high)
+orReady   = not na(dayStart) and time_close >= dayStart + orMin * 60000
+lowerHigh = high < high[1]
+
+// ---------------------------- 1. SCANNER -----------------------------
+qualityOk = close >= minPrice and dAdr >= minAdr and dDv >= minDvM * 1e6
+
+// ---------------------------- 2. DAILY TREND -------------------------
+trendOk = dMom >= minMom and dE10 > dE20 and (not useSma50 or dPrevClose > dS50)
+
+// ---------------------------- 3. SETUPS ------------------------------
+// Pullback: today's or yesterday's low reached the 10/20 EMA zone; trigger
+// = one tick above a bar that made a lower high (the dip is ending when
+// price takes out the prior bar's high).
+emaZone = math.max(dE10, dE20)
+pbArmed = usePB and trendOk and math.min(dayLow, dPrevLow) <= emaZone * (1 + pbTol / 100) and lowerHigh
+// Breakout: tight base over the last consLen days, trigger above the
+// opening-range high and/or the prior-day high.
+baseRange = (dConsHi - dConsLo) / dPrevClose * 100
+baseOk    = baseRange <= consMax * dAdr
+float boLevel = boTrig == "Prior-day high" ? dPrevHigh : boTrig == "Opening-range high" ? (orReady ? orHigh : na) : (orReady ? math.min(orHigh, dPrevHigh) : dPrevHigh)
+boArmed = useBO and trendOk and baseOk and not na(boLevel) and close < boLevel
+// EP: gap up of at least epGap% today; wait for the open to sell off
+// (day low below the open, opening range finished), then buy above a
+// lower-high bar.
+gapPct  = (dayOpen / dPrevClose - 1) * 100
+epArmed = useEP and gapPct >= epGap and orReady and dayLow < dayOpen and lowerHigh
+
+float  trig  = na
+string setup = ""
+if epArmed
+    trig  := high + syminfo.mintick
+    setup := "EP"
+else if boArmed
+    trig  := boLevel + syminfo.mintick
+    setup := "Breakout"
+else if pbArmed
+    trig  := high + syminfo.mintick
+    setup := "Pullback"
+
+// ---------------------------- 4. RISK & SIZING -----------------------
+stopPx  = dayLow - syminfo.mintick
+riskPS  = trig - stopPx
+stopPct = riskPS / trig * 100
+
+// Regime: index trend, drawdown from equity peak, recent results.
+idxOk = idxClose > idxEma
+var float peakEq = na
+peakEq := math.max(nz(peakEq, strategy.equity), strategy.equity)
+ddPct = (1 - strategy.equity / peakEq) * 100
+int nClosed    = strategy.closedtrades
+int recentCnt  = 0
+int recentWins = 0
+if nClosed > 0
+    for i = math.max(0, nClosed - recentN) to nClosed - 1
+        recentCnt += 1
+        if strategy.closedtrades.profit(i) > 0
+            recentWins += 1
+coldStreak  = recentCnt >= recentN and recentWins < recentK
+riskMult    = (regMode == "Halve risk" and not idxOk ? 0.5 : 1.0) * (ddPct >= ddLimit ? 0.5 : 1.0) * (coldStreak ? 0.5 : 1.0)
+riskNow     = riskPct * riskMult
+regimeAllow = regMode != "Block new entries" or idxOk
+
+qty = math.floor(math.min(strategy.equity * riskNow / 100 / riskPS, strategy.equity * maxPos / 100 / trig))
+
+entryOk = barstate.isconfirmed and strategy.position_size == 0 and session.ismarket and not session.islastbar_regular and qualityOk and regimeAllow and not (onePer and enteredToday) and not na(trig) and riskPS > 0 and stopPct <= maxStop and qty >= 1
+
+// ---------------------------- ORDERS ---------------------------------
+var float planStop    = na
+var float planTrig    = na
+var float entryQty    = na
+var float entryPx     = na
+var float slPx        = na
+var float tp1Px       = na
+var float riskInit    = na
+var bool  partialDone = false
+var int   daysInTrade = 0
+
+// Buy-stop for the next bar only; re-evaluated (or cancelled) every bar.
+if entryOk
+    planStop    := stopPx
+    planTrig    := trig
+    partialDone := false
+    strategy.entry("Long", strategy.long, qty=qty, stop=trig, comment=setup)
+else if strategy.position_size == 0
+    strategy.cancel("Long")
+
+newPos = strategy.position_size > 0 and nz(strategy.position_size[1]) == 0
+if newPos
+    entryQty     := strategy.position_size
+    entryPx      := strategy.position_avg_price
+    slPx         := planStop
+    riskInit     := entryPx - planStop
+    tp1Px        := entryPx + targetR * riskInit
+    partialDone  := false
+    daysInTrade  := 0
+    enteredToday := true
+    label.new(bar_index, low, "BUY " + str.tostring(entryQty, "#") + " @ " + str.tostring(entryPx, format.mintick) + "\nstop " + str.tostring(slPx, format.mintick) + " (-" + str.tostring(riskInit / entryPx * 100, "#.##") + "%)\n" + str.tostring(targetR, "#.#") + "R = " + str.tostring(tp1Px, format.mintick) + "  risk " + str.tostring(riskNow, "#.##") + "%", style=label.style_label_up, color=color.new(color.green, 10), textcolor=color.white, size=size.small)
+
+if strategy.position_size > 0 and strategy.position_size < entryQty and not partialDone
+    partialDone := true
+    if beAfter
+        slPx := math.max(slPx, entryPx)
+
+if strategy.position_size > 0 and session.isfirstbar_regular and not newPos
+    daysInTrade += 1
+
+// Stop for the whole position; before the first sale, partPct% also has a
+// limit order at targetR.
+float exStop = strategy.position_size > 0 ? slPx : planStop
+float exTp   = strategy.position_size > 0 ? tp1Px : planTrig + targetR * (planTrig - planStop)
+if entryOk or strategy.position_size > 0
+    if not partialDone
+        strategy.exit("TP1", from_entry="Long", qty_percent=partPct, limit=exTp, stop=exStop, comment="First sale / stop")
+    strategy.exit("Rest", from_entry="Long", stop=exStop, comment="Stop")
+
+// Daily 9 EMA trail: on the last regular bar, today's EMA value is known
+// from yesterday's EMA and today's close; a close below it sells at the
+// next open.
+e9Today  = dE9 + 2.0 / (trailLen + 1) * (close - dE9)
+trailHit = close < e9Today
+if strategy.position_size > 0 and session.islastbar_regular and not newPos
+    if trailHit and (partialDone or trailPre)
+        strategy.close("Long", comment="Daily close < " + str.tostring(trailLen) + " EMA")
+    else if timeStop > 0 and not partialDone and daysInTrade >= timeStop
+        strategy.close("Long", comment="Time stop")
+
+// ---------------------------- CHART ----------------------------------
+inMkt = session.ismarket
+plot(showLvl and inMkt ? dayLow : na, "Low of day (stop)", color=color.new(color.red, 40), style=plot.style_linebr)
+plot(showLvl and inMkt and orReady ? orHigh : na, "Opening-range high", color=color.new(color.orange, 30), style=plot.style_linebr)
+plot(showLvl ? dPrevHigh : na, "Prior-day high", color=color.new(color.yellow, 30), style=plot.style_stepline)
+plot(showLvl ? dE9 : na, "Daily EMA (trail, yesterday)", color=color.new(color.fuchsia, 20), style=plot.style_stepline)
+plot(showLvl ? dE10 : na, "Daily EMA 10", color=color.new(color.aqua, 50), style=plot.style_stepline)
+plot(showLvl ? dE20 : na, "Daily EMA 20", color=color.new(color.blue, 50), style=plot.style_stepline)
+
+inPos = strategy.position_size > 0
+plot(inPos ? entryPx : na, "Entry", color=color.new(color.blue, 0), linewidth=2, style=plot.style_linebr)
+plot(inPos ? slPx : na, "Stop", color=color.new(color.red, 0), linewidth=2, style=plot.style_linebr)
+plot(inPos and not partialDone ? tp1Px : na, "First sale (3R)", color=color.new(color.green, 0), linewidth=2, style=plot.style_linebr)
+plotshape(entryOk, "Buy-stop placed", shape.triangleup, location.belowbar, color.new(color.green, 40), size=size.tiny)
+
+// ---------------------------- STATUS TABLE ---------------------------
+okTxt(bool b) => b ? "✔" : "✘"
+okBg(bool b)  => b ? color.new(color.green, 25) : color.new(color.red, 25)
+row(table t, int r, string a, string b, string c, color bg) =>
+    table.cell(t, 0, r, a, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
+    table.cell(t, 1, r, b, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
+    table.cell(t, 2, r, c, text_color=color.white, bgcolor=bg)
+
+tfOk = timeframe.isintraday and timeframe.multiplier <= 15
+var table tbl = table.new(position.top_right, 3, 9, border_width=1, border_color=color.new(color.gray, 50))
+if showTbl and barstate.islast
+    hdr = color.new(color.gray, 20)
+    row(tbl, 0, "Scanner", "price " + str.tostring(close, format.mintick) + ", ADR " + str.tostring(dAdr, "#.#") + "%, $vol " + str.tostring(dDv / 1e6, "#.#") + "M", okTxt(qualityOk), okBg(qualityOk))
+    row(tbl, 1, "Daily trend", str.tostring(dMom, "#") + "% in " + str.tostring(momLen) + "d, EMA10 " + (dE10 > dE20 ? ">" : "<") + " EMA20, " + (dPrevClose > dS50 ? "above" : "below") + " SMA50", okTxt(trendOk), okBg(trendOk))
+    row(tbl, 2, "Setups armed", "Pullback " + okTxt(pbArmed) + "  Breakout " + okTxt(boArmed) + " (base " + str.tostring(baseRange / dAdr, "#.#") + "x ADR)  EP " + okTxt(epArmed) + " (gap " + str.tostring(gapPct, "#.#") + "%)", setup == "" ? "-" : setup, setup == "" ? hdr : color.new(color.green, 25))
+    row(tbl, 3, "Trigger / stop", na(trig) ? "no trigger" : "buy-stop " + str.tostring(trig, format.mintick) + ", LOD stop " + str.tostring(stopPx, format.mintick) + " (" + str.tostring(stopPct, "#.##") + "%, max " + str.tostring(maxStop, "#.#") + "%)", okTxt(not na(trig) and stopPct <= maxStop), okBg(not na(trig) and stopPct <= maxStop))
+    row(tbl, 4, "Regime", idxSym + (idxOk ? " above" : " below") + " " + str.tostring(idxLen) + "d EMA; drawdown " + str.tostring(ddPct, "#.#") + "%; " + str.tostring(recentWins) + "/" + str.tostring(recentCnt) + " recent wins", "risk " + str.tostring(riskNow, "#.##") + "%", riskMult < 1 ? color.new(color.orange, 20) : hdr)
+    row(tbl, 5, "Position", inPos ? str.tostring(strategy.position_size, "#") + " sh, " + str.tostring((close - entryPx) / riskInit, "#.##") + "R open, day " + str.tostring(daysInTrade) : "flat", inPos ? (partialDone ? "trailing" : "to " + str.tostring(targetR, "#.#") + "R") : "-", hdr)
+    row(tbl, 6, "Trail", "daily EMA" + str.tostring(trailLen) + " today ~" + str.tostring(e9Today, format.mintick), okTxt(not trailHit), okBg(not trailHit))
+    row(tbl, 7, "Chart", timeframe.period + (tfOk ? " (intraday)" : " - use a 1-15m chart"), tfOk ? "OK" : "CHECK", tfOk ? hdr : color.new(color.orange, 20))
+    row(tbl, 8, "Next bar", entryOk ? "buy-stop " + str.tostring(qty, "#") + " sh @ " + str.tostring(trig, format.mintick) : "no order", entryOk ? "ORDER" : "WAIT", entryOk ? color.new(color.green, 20) : hdr)
