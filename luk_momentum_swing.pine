@@ -3,7 +3,7 @@ strategy("Luk Momentum Swing (Pullback / Breakout / EP)", shorttitle="Luk Swing"
      pyramiding=0, process_orders_on_close=false, calc_on_every_tick=false,
      commission_type=strategy.commission.percent, commission_value=0.02, slippage=2,
      initial_capital=50000, default_qty_type=strategy.fixed, default_qty_value=1,
-     max_labels_count=500)
+     max_labels_count=500, max_boxes_count=50, max_lines_count=50)
 
 // =====================================================================
 //  Long-only momentum swing strategy in the style described for Martin Luk
@@ -24,6 +24,10 @@ strategy("Luk Momentum Swing (Pullback / Breakout / EP)", shorttitle="Luk Swing"
 //               with the DAILY 9 EMA (daily close below it -> sell next open).
 //  5. Regime  : index below its 50-day EMA, a drawdown, or a cold streak
 //               each halve the risk (or block entries).
+//  6. Zones   : support / resistance zones from confirmed DAILY swing
+//               points, clustered and counted; used to suggest a structure
+//               stop and a TP zone, and (optionally) to skip setups that have
+//               strong resistance before the first-sale level.
 //  Entries are buy-stop orders placed at a bar's close for the next bar, so
 //  nothing fills at a price that was already known.
 // =====================================================================
@@ -79,6 +83,19 @@ recentK  = input.int(2, "Cold streak: halve risk if fewer winners than", minval=
 grpDisp  = "Display"
 showTbl  = input.bool(true, "Show status table", group=grpDisp)
 showLvl  = input.bool(true, "Show levels (LOD, ORH, prior-day high, daily EMAs)", group=grpDisp)
+showPlan = input.bool(true, "Show entry plan (buy-stop / stop / first-sale lines)", group=grpDisp, tooltip="Drawn when a buy-stop is placed for the next bar. Only the current plan is kept on the chart; fills keep their BUY label.")
+planLen  = input.int(8, "Plan line length (bars)", minval=1, maxval=100, group=grpDisp)
+
+grpZone  = "7 | Support / resistance zones"
+showZone = input.bool(true, "Show S/R zones", group=grpZone)
+pivLen   = input.int(3, "Daily swing strength (days each side)", minval=1, maxval=20, group=grpZone, tooltip="A daily high (low) is a swing point when it is the highest (lowest) of this many days on each side. It is only known after those days have closed, so zones never repaint.")
+zoneAtr  = input.float(0.3, "Zone height (x daily ATR 14)", minval=0.05, step=0.05, group=grpZone, tooltip="Swing points closer together than this are merged into one zone of this height.")
+strongN  = input.int(2, "Strong zone: min touches", minval=1, group=grpZone, tooltip="Touches = number of daily swing highs/lows inside the zone (the last 10 swing highs and 10 swing lows are used).")
+nZones   = input.int(3, "Zones shown each side", minval=1, maxval=10, group=grpZone)
+onlyStr  = input.bool(false, "Show only strong zones", group=grpZone)
+zoneBack = input.int(150, "Zone box starts N bars back", minval=1, maxval=5000, group=grpZone)
+lblOff   = input.int(10, "Zone labels: bars right of last bar", minval=0, maxval=300, group=grpZone)
+skipRes  = input.bool(false, "Skip setups with strong resistance before first-sale level", group=grpZone, tooltip="Off by default. When on, a buy-stop is not placed if the nearest strong resistance zone above the trigger starts below the first-sale (3R) price.")
 
 // ---------------------------- DAILY DATA -----------------------------
 // request.security() is required for daily ADR, dollar volume, EMAs and the
@@ -99,6 +116,114 @@ dailyStats() =>
 
 idxStats() => [close[1], ta.ema(close, idxLen)[1]]
 [idxClose, idxEma] = request.security(idxSym, "1D", idxStats(), lookahead=barmerge.lookahead_on)
+
+// Daily swing points for the S/R zones. Daily (not intraday) pivots are used
+// because they are the levels swing traders watch, and because the daily
+// history goes back much further than a 5m chart's. ta.pivothigh/low only
+// return a value once pivLen more days have CLOSED, and [1] + lookahead_on
+// again means the last completed day, so nothing here repaints. The last 10
+// swing highs and 10 swing lows are returned (fixed count: a tuple cannot
+// change size), plus the daily ATR for the zone height and the day's time
+// stamp, which tells the chart when to rebuild the zones.
+dailyPivots() =>
+    float ph = ta.pivothigh(high, pivLen, pivLen)
+    float pl = ta.pivotlow(low, pivLen, pivLen)
+    bool  hH = not na(ph)
+    bool  hL = not na(pl)
+    float h0 = ta.valuewhen(hH, ph, 0)
+    float h1 = ta.valuewhen(hH, ph, 1)
+    float h2 = ta.valuewhen(hH, ph, 2)
+    float h3 = ta.valuewhen(hH, ph, 3)
+    float h4 = ta.valuewhen(hH, ph, 4)
+    float h5 = ta.valuewhen(hH, ph, 5)
+    float h6 = ta.valuewhen(hH, ph, 6)
+    float h7 = ta.valuewhen(hH, ph, 7)
+    float h8 = ta.valuewhen(hH, ph, 8)
+    float h9 = ta.valuewhen(hH, ph, 9)
+    float l0 = ta.valuewhen(hL, pl, 0)
+    float l1 = ta.valuewhen(hL, pl, 1)
+    float l2 = ta.valuewhen(hL, pl, 2)
+    float l3 = ta.valuewhen(hL, pl, 3)
+    float l4 = ta.valuewhen(hL, pl, 4)
+    float l5 = ta.valuewhen(hL, pl, 5)
+    float l6 = ta.valuewhen(hL, pl, 6)
+    float l7 = ta.valuewhen(hL, pl, 7)
+    float l8 = ta.valuewhen(hL, pl, 8)
+    float l9 = ta.valuewhen(hL, pl, 9)
+    float dayAtr = ta.atr(14)
+    [h0[1], h1[1], h2[1], h3[1], h4[1], h5[1], h6[1], h7[1], h8[1], h9[1], l0[1], l1[1], l2[1], l3[1], l4[1], l5[1], l6[1], l7[1], l8[1], l9[1], dayAtr[1], time[1]]
+
+[pH0, pH1, pH2, pH3, pH4, pH5, pH6, pH7, pH8, pH9, pL0, pL1, pL2, pL3, pL4, pL5, pL6, pL7, pL8, pL9, dAtr, dTime] = request.security(syminfo.tickerid, "1D", dailyPivots(), lookahead=barmerge.lookahead_on)
+
+// ---------------------------- S/R ZONES ------------------------------
+// Rebuilt once per day (when new daily data arrives). All swing highs and
+// lows are sorted and clustered: a point joins the current cluster while it
+// is within one zone height of the cluster's lowest point. Each cluster is a
+// zone of height zoneAtr x ATR around its centre; touches = points in it.
+// Whether a zone is support or resistance depends on where price is.
+addZone(array<float> lo, array<float> hi, array<float> mid, array<int> tc, float a, float b, int n, float w) =>
+    float m = (a + b) / 2
+    lo.push(m - w / 2)
+    hi.push(m + w / 2)
+    mid.push(m)
+    tc.push(n)
+
+// First zone (lowest) whose key is above ref with >= minT touches; -1 if none.
+zoneAbove(array<float> key, array<int> tc, float ref, int minT) =>
+    int idx = -1
+    int n = key.size()
+    if n > 0 and not na(ref)
+        for i = 0 to n - 1
+            if key.get(i) > ref and tc.get(i) >= minT
+                idx := i
+                break
+    idx
+
+// Highest zone whose key is at or below ref with >= minT touches; -1 if none.
+zoneBelow(array<float> key, array<int> tc, float ref, int minT) =>
+    int idx = -1
+    int n = key.size()
+    if n > 0 and not na(ref)
+        for i = n - 1 to 0
+            if key.get(i) <= ref and tc.get(i) >= minT
+                idx := i
+                break
+    idx
+
+var array<float> zLo  = array.new<float>()
+var array<float> zHi  = array.new<float>()
+var array<float> zMid = array.new<float>()
+var array<int>   zTch = array.new<int>()
+bool newDaily = not na(dTime) and (na(dTime[1]) or dTime != dTime[1])
+if newDaily
+    zLo.clear()
+    zHi.clear()
+    zMid.clear()
+    zTch.clear()
+    array<float> raw = array.from(pH0, pH1, pH2, pH3, pH4, pH5, pH6, pH7, pH8, pH9, pL0, pL1, pL2, pL3, pL4, pL5, pL6, pL7, pL8, pL9)
+    array<float> pts = array.new<float>()
+    for p in raw
+        if not na(p)
+            pts.push(p)
+    pts.sort(order.ascending)
+    float zw = zoneAtr * dAtr
+    int   np = pts.size()
+    if np > 0 and zw > 0
+        float cLo = pts.get(0)
+        float cHi = cLo
+        int   cN  = 1
+        if np > 1
+            for i = 1 to np - 1
+                float q = pts.get(i)
+                if q - cLo <= zw
+                    cHi := q
+                    cN  += 1
+                else
+                    addZone(zLo, zHi, zMid, zTch, cLo, cHi, cN, zw)
+                    cLo := q
+                    cHi := q
+                    cN  := 1
+        addZone(zLo, zHi, zMid, zTch, cLo, cHi, cN, zw)
 
 // ---------------------------- INTRADAY DAY TRACKING ------------------
 var float dayOpen  = na
@@ -205,7 +330,33 @@ regimeAllow = regMode != "Block new entries" or idxOk
 
 qty = math.floor(math.min(strategy.equity * riskNow / 100 / riskPS, strategy.equity * maxPos / 100 / trig))
 
-entryOk = barstate.isconfirmed and strategy.position_size == 0 and session.ismarket and not session.islastbar_regular and qualityOk and regimeAllow and not (onePer and enteredToday) and not na(trig) and riskPS > 0 and stopPct <= maxStop and qty >= 1
+// TP / SL suggestions from the zones, measured from the buy-stop when a
+// setup is armed, otherwise from the current close (with the LOD stop).
+// TP zone   : nearest STRONG zone lying wholly above the reference price.
+// Structure : just below the nearest STRONG zone whose bottom is at or below
+//             the reference price (a zone price sits in counts as support).
+// The strategy's real stop stays the low of the day.
+float refPx  = na(trig) ? close : trig
+float refRsk = refPx - stopPx
+float refT1  = refPx + targetR * refRsk
+int   tpIdx  = zoneAbove(zLo, zTch, refPx, strongN)
+int   ssIdx  = zoneBelow(zLo, zTch, refPx, strongN)
+float tpLo   = na
+float tpHi   = na
+if tpIdx >= 0
+    tpLo := zLo.get(tpIdx)
+    tpHi := zHi.get(tpIdx)
+float ssStop = na
+if ssIdx >= 0
+    ssStop := zLo.get(ssIdx) - syminfo.mintick
+float tpR       = refRsk > 0 ? (tpLo - refPx) / refRsk : na
+bool  resBefore = not na(tpLo) and not na(refT1) and tpLo < refT1
+float ssPct     = (refPx - ssStop) / refPx * 100
+bool  ssTighter = not na(ssStop) and not na(stopPx) and ssStop > stopPx
+bool  ssInCap   = not na(ssPct) and ssPct > 0 and ssPct <= maxStop
+bool  resBlock  = skipRes and not na(trig) and resBefore
+
+entryOk = barstate.isconfirmed and strategy.position_size == 0 and session.ismarket and not session.islastbar_regular and qualityOk and regimeAllow and not (onePer and enteredToday) and not na(trig) and riskPS > 0 and stopPct <= maxStop and qty >= 1 and not resBlock
 
 // ---------------------------- ORDERS ---------------------------------
 
@@ -275,6 +426,77 @@ plot(inPos ? slPx : na, "Stop", color=color.new(color.red, 0), linewidth=2, styl
 plot(inPos and not partialDone ? tp1Px : na, "First sale (3R)", color=color.new(color.green, 0), linewidth=2, style=plot.style_linebr)
 plotshape(entryOk, "Buy-stop placed", shape.triangleup, location.belowbar, color.new(color.green, 40), size=size.tiny)
 
+// ENTRY PLAN: when a buy-stop is placed, show its trigger, stop and first
+// sale for the next bar. Only the current plan is kept; it is refreshed on
+// confirmed bars only, so it stays visible while the order works in real time.
+var label planLbl = na
+var line  planE   = na
+var line  planS   = na
+var line  planT   = na
+if barstate.isconfirmed
+    if not na(planLbl)
+        label.delete(planLbl)
+        planLbl := na
+    if not na(planE)
+        line.delete(planE)
+        planE := na
+    if not na(planS)
+        line.delete(planS)
+        planS := na
+    if not na(planT)
+        line.delete(planT)
+        planT := na
+    if showPlan and entryOk
+        float t1Plan = trig + targetR * riskPS
+        string pTxt = "PLAN " + setup + ": buy-stop " + str.tostring(trig, format.mintick) + ", SL " + str.tostring(stopPx, format.mintick) + " (-" + str.tostring(stopPct, "#.##") + "%), " + str.tostring(targetR, "#.#") + "R = " + str.tostring(t1Plan, format.mintick) + "\n" + str.tostring(qty, "#") + " sh, risk " + str.tostring(riskNow, "#.##") + "%"
+        if not na(tpLo)
+            pTxt := pTxt + "\nTP zone " + str.tostring(tpLo, format.mintick) + " - " + str.tostring(tpHi, format.mintick) + " (" + str.tostring(tpR, "#.#") + "R)"
+            if resBefore
+                pTxt := pTxt + "\n! resistance before " + str.tostring(targetR, "#.#") + "R - lower odds"
+        else
+            pTxt := pTxt + "\nno strong resistance above"
+        if not na(ssStop)
+            pTxt := pTxt + "\nstructure SL " + str.tostring(ssStop, format.mintick) + " (-" + str.tostring(ssPct, "#.##") + "%, " + (ssTighter ? "tighter" : "wider") + " than LOD)"
+        planE   := line.new(bar_index, trig, bar_index + planLen, trig, color=color.new(color.blue, 0), width=2)
+        planS   := line.new(bar_index, stopPx, bar_index + planLen, stopPx, color=color.new(color.red, 0), width=2, style=line.style_dashed)
+        planT   := line.new(bar_index, t1Plan, bar_index + planLen, t1Plan, color=color.new(color.green, 0), width=2, style=line.style_dashed)
+        planLbl := label.new(bar_index, t1Plan, pTxt, style=label.style_label_down, color=resBefore ? color.new(color.orange, 10) : color.new(color.blue, 10), textcolor=color.white, size=size.small, textalign=text.align_left)
+
+// S/R ZONES: nearest nZones zones above price (resistance) and below it
+// (support), split by the zone's centre. Redrawn on the last bar only.
+drawZone(array<box> bx, array<label> lb, float lo, float hi, int tch, bool isRes, int k, bool strong) =>
+    color  c    = isRes ? color.red : color.green
+    float  pct  = isRes ? (lo / close - 1) * 100 : (hi / close - 1) * 100
+    string kind = isRes ? "resistance R" : "support S"
+    string nm   = strong ? "Strong " + kind : (isRes ? "Resistance R" : "Support S")
+    string txt  = nm + str.tostring(k) + " " + str.tostring(lo, format.mintick) + " - " + str.tostring(hi, format.mintick) + " (" + (pct >= 0 ? "+" : "") + str.tostring(pct, "#.#") + "%, " + str.tostring(tch) + (tch == 1 ? " touch)" : " touches)")
+    bx.push(box.new(math.max(0, bar_index - zoneBack), hi, bar_index + lblOff, lo, border_color=color.new(c, strong ? 0 : 60), border_width=strong ? 2 : 1, border_style=strong ? line.style_solid : line.style_dotted, bgcolor=color.new(c, strong ? 75 : 92)))
+    lb.push(label.new(bar_index + lblOff, (lo + hi) / 2, txt, style=label.style_label_left, color=color.new(c, strong ? 15 : 60), textcolor=color.white, size=size.small))
+
+var array<box>   zBoxes  = array.new<box>()
+var array<label> zLabels = array.new<label>()
+if barstate.islast
+    for b in zBoxes
+        box.delete(b)
+    for l in zLabels
+        label.delete(l)
+    zBoxes.clear()
+    zLabels.clear()
+    int zCnt = zMid.size()
+    if showZone and zCnt > 0
+        int kR = 0
+        for i = 0 to zCnt - 1
+            bool st = zTch.get(i) >= strongN
+            if kR < nZones and zMid.get(i) > close and (st or not onlyStr)
+                kR += 1
+                drawZone(zBoxes, zLabels, zLo.get(i), zHi.get(i), zTch.get(i), true, kR, st)
+        int kS = 0
+        for i = zCnt - 1 to 0
+            bool st = zTch.get(i) >= strongN
+            if kS < nZones and zMid.get(i) <= close and (st or not onlyStr)
+                kS += 1
+                drawZone(zBoxes, zLabels, zLo.get(i), zHi.get(i), zTch.get(i), false, kS, st)
+
 // ---------------------------- STATUS TABLE ---------------------------
 okTxt(bool b) => b ? "✔" : "✘"
 okBg(bool b)  => b ? color.new(color.green, 25) : color.new(color.red, 25)
@@ -284,7 +506,7 @@ row(table t, int r, string a, string b, string c, color bg) =>
     table.cell(t, 2, r, c, text_color=color.white, bgcolor=bg)
 
 tfOk = timeframe.isintraday and timeframe.multiplier <= 15
-var table tbl = table.new(position.top_right, 3, 10, border_width=1, border_color=color.new(color.gray, 50))
+var table tbl = table.new(position.top_right, 3, 12, border_width=1, border_color=color.new(color.gray, 50))
 if showTbl and barstate.islast
     hdr = color.new(color.gray, 20)
     row(tbl, 0, "Scanner", "price " + str.tostring(close, format.mintick) + ", ADR " + str.tostring(dAdr, "#.#") + "%, $vol " + str.tostring(dDv / 1e6, "#.#") + "M", okTxt(qualityOk), okBg(qualityOk))
@@ -312,4 +534,19 @@ if showTbl and barstate.islast
     float expR = nT > 0 ? (sWin + sLos) / nT : na
     string resTxt = nT == 0 ? "no closed trades yet" : str.tostring(nT) + " trades, win " + str.tostring(nWin * 100.0 / nT, "#") + "%, avg win " + str.tostring(nWin > 0 ? sWin / nWin : 0.0, "#.#") + "R, avg loss " + str.tostring(nT > nWin ? sLos / (nT - nWin) : 0.0, "#.##") + "R, worst " + str.tostring(wrst, "#.#") + "R, " + str.tostring(nGap) + " worse than -" + str.tostring(gapFlagR, "#.#") + "R"
     row(tbl, 9, "Results (R)", resTxt, nT == 0 ? "-" : "exp " + str.tostring(expR, "#.##") + "R", nT == 0 ? hdr : expR > 0 ? color.new(color.green, 25) : color.new(color.red, 25))
-    row(tbl, 8, "Next bar", entryOk ? "buy-stop " + str.tostring(qty, "#") + " sh @ " + str.tostring(trig, format.mintick) : "no order", entryOk ? "ORDER" : "WAIT", entryOk ? color.new(color.green, 20) : hdr)
+    row(tbl, 8, "Next bar", entryOk ? "buy-stop " + str.tostring(qty, "#") + " sh @ " + str.tostring(trig, format.mintick) : resBlock ? "blocked: strong resistance before " + str.tostring(targetR, "#.#") + "R" : "no order", entryOk ? "ORDER" : resBlock ? "BLOCKED" : "WAIT", entryOk ? color.new(color.green, 20) : resBlock ? color.new(color.orange, 20) : hdr)
+    // Nearest strong zones around the current price (split by zone centre).
+    int    rI   = zoneAbove(zMid, zTch, close, strongN)
+    int    sI   = zoneBelow(zMid, zTch, close, strongN)
+    string sTxt = "none"
+    string rTxt = "none"
+    if sI >= 0
+        sTxt := str.tostring(zLo.get(sI), format.mintick) + "-" + str.tostring(zHi.get(sI), format.mintick) + " (" + str.tostring((zHi.get(sI) / close - 1) * 100, "#.#") + "%, " + str.tostring(zTch.get(sI)) + "x)"
+    if rI >= 0
+        rTxt := str.tostring(zLo.get(rI), format.mintick) + "-" + str.tostring(zHi.get(rI), format.mintick) + " (+" + str.tostring((zLo.get(rI) / close - 1) * 100, "#.#") + "%, " + str.tostring(zTch.get(rI)) + "x)"
+    row(tbl, 10, "Strong S / R", "support " + sTxt + "  |  resistance " + rTxt, str.tostring(zMid.size()) + " zones", hdr)
+    // TP / SL ideas measured from the buy-stop (or the close if none).
+    string slTxt = na(ssStop) ? "struct SL: none" : "struct SL " + str.tostring(ssStop, format.mintick) + " (-" + str.tostring(ssPct, "#.##") + "%, " + (ssTighter ? "tighter" : "wider") + " than LOD, " + (ssInCap ? "within" : "over") + " " + str.tostring(maxStop, "#.#") + "% cap)"
+    string tpTxt = na(tpLo) ? "TP zone: none above" : "TP zone " + str.tostring(tpLo, format.mintick) + "-" + str.tostring(tpHi, format.mintick) + " = " + str.tostring(tpR, "#.#") + "R" + (resBefore ? " - resistance before " + str.tostring(targetR, "#.#") + "R, lower odds" : "")
+    string tpCol = na(tpLo) ? "-" : resBefore ? (skipRes ? "SKIP" : "RES<" + str.tostring(targetR, "#.#") + "R") : "OK"
+    row(tbl, 11, "TP / SL (" + (na(trig) ? "from close" : "from trigger") + ")", slTxt + "; " + tpTxt, tpCol, resBefore ? color.new(color.orange, 20) : na(tpLo) ? hdr : color.new(color.green, 25))
