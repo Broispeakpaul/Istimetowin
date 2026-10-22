@@ -3,7 +3,7 @@ strategy("Five-Filter Long Strategy", shorttitle="5F Long", overlay=true,
      pyramiding=0, process_orders_on_close=false, calc_on_every_tick=false,
      commission_type=strategy.commission.percent, commission_value=0.05, slippage=2,
      default_qty_type=strategy.percent_of_equity, default_qty_value=100,
-     initial_capital=100000, max_labels_count=500, max_boxes_count=100)
+     initial_capital=100000, max_labels_count=500, max_boxes_count=100, max_lines_count=500)
 
 // =====================================================================
 //  Long-only swing strategy for a 15-MINUTE chart. Trades are held for at
@@ -27,6 +27,14 @@ strategy("Five-Filter Long Strategy", shorttitle="5F Long", overlay=true,
 //  ticks slippage are set above (Settings > Properties).
 //  Daily figures come from completed daily bars ([1] + lookahead_on), so
 //  nothing from an unfinished day leaks into history.
+//
+//  Strong ("pressure") zones: support/resistance zones built from at least
+//  N confirmed swings. The nearest strong support gives a STRUCTURE stop
+//  (below the zone, minus the same volatility buffer) and the nearest
+//  strong resistance is the "TP zone". Both are always shown; they are
+//  used for the orders only when the matching inputs are switched on.
+//  Each entry (and the live setup on the last bar) gets a PLAN label with
+//  entry / SL / TP lines; rejected setups show "no trade: reason".
 // =====================================================================
 
 // ---------------------------- INPUTS ---------------------------------
@@ -70,11 +78,13 @@ maxRR     = input.float(5.0, "Max reward / risk", minval=0.5, step=0.1, group=gr
 minEV     = input.float(0.05, "Min expected value (R)", step=0.01, group=grpMod, tooltip="Expected profit per trade in units of the risk, after costs and gap risk.")
 costPct   = input.float(0.15, "Round-trip cost in model (%)", minval=0.0, step=0.01, group=grpMod, tooltip="Commission both sides + slippage. Keep in line with Settings > Properties.")
 capAtRes  = input.bool(true, "Cap target at nearest resistance zone", group=grpMod)
+capStrong = input.bool(false, "Cap target at nearest STRONG resistance only", group=grpMod, tooltip="Off: the target is capped at the nearest resistance zone of any strength. On: weak (few-touch) resistance is ignored and only the nearest strong resistance zone caps the target. Needs the option above.")
 
 // Stop loss
 grpStop    = "Stop loss"
 slBufSig   = input.float(0.25, "Buffer below support (x daily sigma)", minval=0.0, step=0.05, group=grpStop)
 minStopSig = input.float(1.5, "Min stop distance (x daily sigma)", minval=0.1, step=0.1, group=grpStop, tooltip="A multi-week trade should not be stopped out by one or two normal days of noise.")
+useZoneSL  = input.bool(false, "Use strong support zone for stop", group=grpStop, tooltip="Off: stop below the swing/pivot support of filter 4 (model SL); the structure SL is only shown. On: stop just below the bottom of the nearest STRONG support zone minus the buffer above, still never closer than the min stop distance. Falls back to the model SL when there is no strong support below price.")
 
 // Gap risk (Poisson)
 grpJump   = "Gap risk (Poisson)"
@@ -94,6 +104,8 @@ zoneStr      = input.int(26, "Zone pivot strength (bars each side)", minval=2, g
 zoneAtrMult  = input.float(1.0, "Zone half-height (x chart ATR)", minval=0.05, step=0.05, group=grpZone)
 zonesPerSide = input.int(3, "Zones shown per side", minval=1, maxval=10, group=grpZone)
 zoneMem      = input.int(30, "Zones remembered", minval=5, maxval=100, group=grpZone)
+strongTouch  = input.int(2, "Strong zone = at least N touches", minval=1, maxval=20, group=grpZone, tooltip="Touches = confirmed swing highs/lows merged into a zone. Zones with at least this many are strong (pressure) zones: drawn bolder, labelled 'Strong', and used for the structure stop and the TP zone.")
+onlyStrong   = input.bool(false, "Show only strong zones", group=grpZone)
 supCol       = input.color(color.green, "Support color", group=grpZone)
 resCol       = input.color(color.red, "Resistance color", group=grpZone)
 showZoneLbl  = input.bool(true, "Label zones (rank, price range, distance, touches)", group=grpZone)
@@ -113,6 +125,8 @@ riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval=0.01, maxval
 coolBars  = input.int(26, "Cooldown after an exit (bars)", minval=0, group=grpMisc)
 showTable = input.bool(true, "Show filter table", group=grpMisc)
 showNear  = input.bool(false, "Label bars where filters 1-4 pass but the model rejects", group=grpMisc)
+showPlan  = input.bool(true, "Show entry plan lines + live setup plan", group=grpMisc, tooltip="Short entry / SL / TP lines at every entry, and on the last bar a PLAN (or gray 'no trade: reason') whenever filters 1-4 pass.")
+planBars  = input.int(8, "Plan line length (bars)", minval=1, maxval=100, group=grpMisc)
 
 // ---------------------------- TYPES & HELPERS ------------------------
 type Zone
@@ -184,9 +198,45 @@ nearestZones(array<Zone> zs, float px, bool below, int n) =>
             pool.remove(bestIdx)
     out
 
-// Zone box; more touches = more opaque (stronger zone).
-drawZone(Zone z, color c) =>
-    box.new(math.max(z.firstBar, bar_index - 4999), z.top, bar_index + 5, z.bot, border_color=color.new(c, 40), bgcolor=color.new(c, math.max(65, 90 - 5 * z.touches)), extend=extend.right)
+// Nearest single zone on one side of price with at least minT touches (na if none).
+nearestZone(array<Zone> zs, float px, bool below, int minT) =>
+    Zone best = na
+    for z in zs
+        bool onSide = below ? z.top < px : z.bot > px
+        if onSide and z.touches >= minT and (na(best) or (below ? z.top > best.top : z.bot < best.bot))
+            best := z
+    best
+
+// Zones with at least minT touches.
+strongZonesOf(array<Zone> zs, int minT) =>
+    array<Zone> out = array.new<Zone>()
+    for z in zs
+        if z.touches >= minT
+            out.push(z)
+    out
+
+sameZone(Zone a, Zone b) =>
+    bool same = false
+    if not na(a) and not na(b)
+        same := a.top == b.top and a.bot == b.bot
+    same
+
+zoneInList(array<Zone> arr, Zone z) =>
+    bool found = false
+    for x in arr
+        if sameZone(x, z)
+            found := true
+    found
+
+// Zone box; more touches = more opaque. Strong zones: solid, thicker,
+// fully opaque border and a denser fill.
+drawZone(Zone z, color c, bool strong) =>
+    box bx = na
+    if strong
+        bx := box.new(math.max(z.firstBar, bar_index - 4999), z.top, bar_index + 5, z.bot, border_color=color.new(c, 0), border_width=2, border_style=line.style_solid, bgcolor=color.new(c, math.max(50, 80 - 5 * z.touches)), extend=extend.right)
+    else
+        bx := box.new(math.max(z.firstBar, bar_index - 4999), z.top, bar_index + 5, z.bot, border_color=color.new(c, 40), bgcolor=color.new(c, math.max(65, 90 - 5 * z.touches)), extend=extend.right)
+    bx
 
 // Standard normal CDF (Hart / West double-precision algorithm).
 cnorm(float x) =>
@@ -278,8 +328,25 @@ signStr(float x, string fmt) => (x >= 0 ? "+" : "") + str.tostring(x, fmt)
 // "97.20 - 98.10  (-1.8%, 3 touches)": price range, distance of the zone middle from close, swing count.
 zoneRangeTxt(Zone z) => str.tostring(z.bot, format.mintick) + " - " + str.tostring(z.top, format.mintick) + "  (" + signStr(((z.top + z.bot) / 2 / close - 1) * 100, "#.#") + "%, " + str.tostring(z.touches) + (z.touches == 1 ? " touch)" : " touches)")
 
-drawZoneLabel(Zone z, color c, string txt, int offset, string sz) =>
-    label.new(bar_index + offset, (z.top + z.bot) / 2, txt, style=label.style_label_left, color=color.new(c, 25), textcolor=color.white, size=sz, tooltip="Zone built from " + str.tostring(z.touches) + " confirmed swing high/low(s). Below price = support, above = resistance; a broken zone flips role.")
+drawZoneLabel(Zone z, color c, string txt, int offset, string sz, bool strong) =>
+    label.new(bar_index + offset, (z.top + z.bot) / 2, txt, style=label.style_label_left, color=color.new(c, strong ? 0 : 25), textcolor=color.white, size=sz, tooltip=(strong ? "STRONG zone: " : "Zone ") + "built from " + str.tostring(z.touches) + " confirmed swing high/low(s). Below price = support, above = resistance; a broken zone flips role.")
+
+pxStr(float x) => str.tostring(x, format.mintick)
+
+// "PLAN: entry X, SL Y (-a%), TP Z (+b%, R:R c), P(TP) d%, EV e R"
+planTxt(float e, float sl, float tp, float rr, float pu, float evr) =>
+    "PLAN: entry " + pxStr(e) + ", SL " + pxStr(sl) + " (-" + pctStr((e - sl) / e) + "),\nTP " + pxStr(tp) + " (+" + pctStr(tp / e - 1) + ", R:R " + str.tostring(rr, "#.##") + "), P(TP) " + pctStr(pu) + ", EV " + signStr(evr, "#.##") + " R"
+
+// "Structure SL 94.80 vs model SL 95.20 | TP zone 104.10 = 3.1R" (parts that exist).
+zonePlanTxt(float structSL, float modelSL, bool used, float tpZone, float tpZoneR) =>
+    string s = ""
+    if not na(structSL)
+        s := "Structure SL " + pxStr(structSL) + (used ? " (used)" : " vs model SL " + pxStr(modelSL))
+    if not na(tpZone)
+        s := s + (s == "" ? "" : " | ") + "TP zone " + pxStr(tpZone) + " = " + str.tostring(tpZoneR, "#.#") + "R"
+    s
+
+addReason(string acc, string r) => acc == "" ? r : acc + ", " + r
 
 // ---------------------------- INDICATORS -----------------------------
 atr       = ta.atr(volLen)
@@ -431,9 +498,32 @@ supOk      = not na(supDistSig) and supDistSig <= maxSupSig
 // first) stays at the target probability (bisection), between minRR and
 // maxRR, capped at the nearest resistance zone. Then the model prices the
 // trade: EV = P(TP)*gain + P(SL)*loss + E[time exit] - costs - gap risk.
-stopFrac = dSig > 0 ? math.max((close - (support - slBufSig * dSig * close)) / close, minStopSig * dSig) : na
-stopPx   = roundDown(close * (1 - stopFrac))
-riskFrac = (close - stopPx) / close
+// Structure SL: just below the nearest STRONG support zone minus the same
+// buffer. With "Use strong support zone for stop" it replaces the model SL
+// (support-based), still never closer than minStopSig daily sigmas.
+Zone strongSup = nearestZone(zones, close, true, strongTouch)
+Zone strongRes = nearestZone(zones, close, false, strongTouch)
+modelStopFrac  = dSig > 0 ? math.max((close - (support - slBufSig * dSig * close)) / close, minStopSig * dSig) : na
+modelStopPx    = roundDown(close * (1 - modelStopFrac))
+float structStopPx = na
+if not na(strongSup) and dSig > 0
+    float sPx = roundDown(strongSup.bot - slBufSig * dSig * close)
+    if sPx > 0
+        structStopPx := sPx
+useStruct = useZoneSL and not na(structStopPx)
+stopFrac  = useStruct ? math.max((close - structStopPx) / close, minStopSig * dSig) : modelStopFrac
+stopPx    = roundDown(close * (1 - stopFrac))
+riskFrac  = (close - stopPx) / close
+
+// TP zone: nearest strong resistance, as an R-multiple from the planned
+// entry/stop (or the open position's entry/stop while in a trade).
+float tpZonePx = na
+if not na(strongRes)
+    tpZonePx := roundDown(strongRes.bot)
+inPos     = strategy.position_size > 0
+entryRef  = inPos ? strategy.position_avg_price : close
+stopRef   = inPos and not na(slTicksV) ? entryRef - slTicksV * syminfo.mintick : stopPx
+tpZoneR   = entryRef > stopRef ? (tpZonePx - entryRef) / (entryRef - stopRef) : na
 
 preOk   = volOk and liqOk and momOk and supOk
 flatNow = strategy.position_size == 0
@@ -453,6 +543,7 @@ bool  probOk = false
 bool  rrOk   = false
 bool  evOk   = false
 bool  mCapped = false
+float mCapBot = na
 if doModel and dSig > 0 and not na(muPost) and riskFrac > 0 and riskFrac < 1
     float bLog    = -math.log(1 - riskFrac)
     float pTarget = math.min(0.95, minPwin / calib)
@@ -472,13 +563,14 @@ if doModel and dSig > 0 and not na(muPost) and riskFrac > 0 and riskFrac < 1
             rrSel := lo
     float tp = roundUp(close * (1 + rrSel * riskFrac))
     if capAtRes
-        array<Zone> resNear = nearestZones(zones, close, false, 1)
-        if resNear.size() > 0
-            Zone  rz    = resNear.first()
+        // Any-strength nearest resistance (default) or the nearest strong one.
+        Zone rz = nearestZone(zones, close, false, capStrong ? strongTouch : 1)
+        if not na(rz)
             float capPx = roundDown(rz.bot)
             if capPx < tp
                 tp      := capPx
                 mCapped := true
+                mCapBot := rz.bot
     mTpPx := tp
     mRR   := (tp - close) / (close - stopPx)
     if tp > close
@@ -505,6 +597,28 @@ modelOk = rrOk and evOk and jumpOk and (not reqPwin or probOk)
 // ---------------------------- SIGNAL & ORDERS ------------------------
 qty      = math.floor(math.min(strategy.equity * riskPct / 100 / (close * riskFrac), strategy.equity / close))
 enterNow = barstate.isconfirmed and flatNow and preOk and coolOk and modelOk and qty >= 1
+planOk   = modelOk and coolOk and qty >= 1
+
+// Why a setup is not traded (built only on bars where the model ran).
+string rejTxt = ""
+if doModel
+    if not coolOk
+        rejTxt := addReason(rejTxt, "cooldown after exit")
+    if na(mTpPx)
+        rejTxt := addReason(rejTxt, "model unavailable (no daily data)")
+    else if mTpPx <= close
+        rejTxt := addReason(rejTxt, "resistance at/below price")
+    else
+        if not rrOk
+            rejTxt := addReason(rejTxt, "R:R " + str.tostring(mRR, "#.##") + " < " + str.tostring(minRR, "#.#") + (mCapped ? " (capped by resistance)" : ""))
+        if not evOk
+            rejTxt := addReason(rejTxt, "EV " + signStr(mEVR, "#.##") + "R < " + str.tostring(minEV, "#.##") + "R")
+        if reqPwin and not probOk
+            rejTxt := addReason(rejTxt, "P(TP) " + pctStr(mPU) + " < " + pctStr(minPwin))
+    if not jumpOk
+        rejTxt := addReason(rejTxt, "gap risk " + pctStr(pJump) + " > " + pctStr(maxJumpP))
+    if qty < 1
+        rejTxt := addReason(rejTxt, "size < 1 share")
 
 if enterNow
     tradePRaw := mPURaw
@@ -538,21 +652,63 @@ plot(mEVR, "Model EV (R)", display=display.data_window)
 plot(muPost * 100, "Drift after shrinkage (%/day)", display=display.data_window)
 plot(advD, "Avg daily volume", display=display.data_window)
 plot(rvol, "Relative volume (time of day)", display=display.data_window)
+plot(structStopPx, "Structure SL (strong support)", display=display.data_window)
+plot(tpZoneR, "TP zone (strong resistance) R", display=display.data_window)
 
-// Entry label with the model's projection.
+// Entry: PLAN label with the model's projection, plus short entry / SL / TP
+// lines (fills happen at the next bar's open; SL/TP keep these distances).
+string zPlanTxt = ""
+if enterNow or barstate.islast
+    zPlanTxt := zonePlanTxt(structStopPx, modelStopPx, useStruct, tpZonePx, tpZoneR)
 if enterNow
-    label.new(bar_index, low,
-         "LONG  R:R " + str.tostring(mRR, "#.##") + "  EV " + signStr(mEVR, "#.##") + "R\nP(TP) " + pctStr(mPU) + "  P(SL) " + pctStr(mPL) + "  P(time) " + pctStr(mPT) + "\nSL " + str.tostring(stopPx, format.mintick) + "  TP " + str.tostring(mTpPx, format.mintick) + "  ~" + str.tostring(mHold, "#.#") + "d (max " + str.tostring(holdDays) + "d)",
+    label.new(bar_index, math.min(low, stopPx),
+         "LONG " + planTxt(close, stopPx, mTpPx, mRR, mPU, mEVR) + "\nP(SL) " + pctStr(mPL) + "  P(time) " + pctStr(mPT) + "  ~" + str.tostring(mHold, "#.#") + "d (max " + str.tostring(holdDays) + "d)" + (zPlanTxt == "" ? "" : "\n" + zPlanTxt),
          style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+    if showPlan
+        line.new(bar_index, close, bar_index + planBars, close, color=color.blue, width=2)
+        line.new(bar_index, stopPx, bar_index + planBars, stopPx, color=color.red, width=2)
+        line.new(bar_index, mTpPx, bar_index + planBars, mTpPx, color=color.green, width=2)
 
 // Optional: setups that passed filters 1-4 but were rejected by the model.
 if showNear and barstate.isconfirmed and flatNow and preOk and coolOk and not modelOk
-    label.new(bar_index, high, "✘ model: EV " + signStr(mEVR, "#.##") + "R, R:R " + str.tostring(mRR, "#.#"), style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, high, "✘ no trade: " + rejTxt, style=label.style_label_down, color=color.new(color.gray, 20), textcolor=color.white, size=size.tiny)
+
+// Live setup on the last bar (filters 1-4 pass, flat): PLAN with entry /
+// SL / TP lines, or a gray "no trade: reason". Dotted lines: structure SL
+// (orange) and TP zone (lime) when they differ from the active levels.
+var label       candLbl   = na
+var array<line> candLines = array.new<line>()
+if barstate.islast
+    if not na(candLbl)
+        candLbl.delete()
+        candLbl := na
+    for ln in candLines
+        ln.delete()
+    candLines.clear()
+    if showPlan and flatNow and preOk and not enterNow
+        bool  ok = planOk
+        int   x2 = bar_index + planBars
+        if not na(stopPx)
+            candLines.push(line.new(bar_index, close, x2, close, color=ok ? color.blue : color.gray, width=2))
+            candLines.push(line.new(bar_index, stopPx, x2, stopPx, color=ok ? color.red : color.gray, width=2))
+        if not na(mTpPx) and mTpPx > close
+            candLines.push(line.new(bar_index, mTpPx, x2, mTpPx, color=ok ? color.green : color.gray, width=2))
+        if not na(structStopPx) and structStopPx != stopPx
+            candLines.push(line.new(bar_index, structStopPx, x2, structStopPx, color=color.orange, style=line.style_dotted, width=2))
+        if not na(tpZonePx) and (na(mTpPx) or tpZonePx != mTpPx)
+            candLines.push(line.new(bar_index, tpZonePx, x2, tpZonePx, color=color.lime, style=line.style_dotted, width=2))
+        string head = ok ? "CANDIDATE" + (barstate.isconfirmed ? "" : " (enters if still valid at bar close)") : "✘ no trade: " + rejTxt
+        string body = not na(mTpPx) and mTpPx > close ? "\n" + planTxt(close, stopPx, mTpPx, mRR, mPU, mEVR) : ""
+        string tail = zPlanTxt == "" ? "" : "\n" + zPlanTxt
+        candLbl := label.new(bar_index, na(stopPx) ? low : math.min(low, stopPx), head + body + tail, style=label.style_label_up, color=ok ? color.new(color.blue, 10) : color.new(color.gray, 20), textcolor=color.white, size=size.small)
 
 // Support / resistance zones (redrawn on the last bar from confirmed swings).
 // Labels: rank (S1 = nearest support, R1 = nearest resistance), price
 // range, distance from price and touch count; the zone holding the
 // support used by filter 4 and the resistance capping the target are marked.
+// Strong zones (>= strongTouch touches) are drawn bolder and labelled
+// "Strong ..."; the nearest strong support (structure SL) and strong
+// resistance (TP zone) are always drawn, even beyond the per-side count.
 var array<box>   zoneBoxes  = array.new<box>()
 var array<label> zoneLabels = array.new<label>()
 zLblSize = zoneLblSize == "tiny" ? size.tiny : zoneLblSize == "normal" ? size.normal : size.small
@@ -563,29 +719,45 @@ if showZones and barstate.islast
     for lb in zoneLabels
         lb.delete()
     zoneLabels.clear()
-    array<Zone> supZones = nearestZones(zones, close, true, zonesPerSide)
-    array<Zone> resZones = nearestZones(zones, close, false, zonesPerSide)
+    array<Zone> showPool = zones
+    if onlyStrong
+        showPool := strongZonesOf(zones, strongTouch)
+    array<Zone> supZones = nearestZones(showPool, close, true, zonesPerSide)
+    array<Zone> resZones = nearestZones(showPool, close, false, zonesPerSide)
     array<Zone> inZones  = array.new<Zone>()
-    for z in zones
+    for z in showPool
         if z.bot <= close and z.top >= close
             inZones.push(z)
+    bool supExtra = not na(strongSup) and not zoneInList(supZones, strongSup)
+    bool resExtra = not na(strongRes) and not zoneInList(resZones, strongRes)
+    if supExtra
+        supZones.push(strongSup)
+    if resExtra
+        resZones.push(strongRes)
+    string slMark = not na(structStopPx) ? "  ◄ structure SL " + pxStr(structStopPx) + (useStruct ? " (used)" : "") : ""
+    string tpMark = not na(tpZoneR) ? "  ◄ TP zone " + str.tostring(tpZoneR, "#.#") + "R" : ""
     bool anchorShown = false
     for [i, z] in supZones
-        zoneBoxes.push(drawZone(z, supCol))
+        bool strong = z.touches >= strongTouch
+        zoneBoxes.push(drawZone(z, supCol, strong))
         if showZoneLbl
             bool isAnchor = not anchorShown and support >= z.bot and support <= z.top
             anchorShown := anchorShown or isAnchor
-            zoneLabels.push(drawZoneLabel(z, supCol, "Support S" + str.tostring(i + 1) + "  " + zoneRangeTxt(z) + (isAnchor ? "  ◄ support used" : ""), zoneLblOff, zLblSize))
+            string nm = (strong ? "Strong support" : "Support") + (supExtra and i == supZones.size() - 1 ? "" : " S" + str.tostring(i + 1))
+            zoneLabels.push(drawZoneLabel(z, supCol, nm + "  " + zoneRangeTxt(z) + (isAnchor ? "  ◄ support used" : "") + (sameZone(z, strongSup) ? slMark : ""), zoneLblOff, zLblSize, strong))
     for [i, z] in resZones
-        zoneBoxes.push(drawZone(z, resCol))
+        bool strong = z.touches >= strongTouch
+        zoneBoxes.push(drawZone(z, resCol, strong))
         if showZoneLbl
-            zoneLabels.push(drawZoneLabel(z, resCol, "Resistance R" + str.tostring(i + 1) + "  " + zoneRangeTxt(z) + (i == 0 and mCapped and flatNow ? "  ◄ caps target" : ""), zoneLblOff, zLblSize))
+            string nm = (strong ? "Strong resistance" : "Resistance") + (resExtra and i == resZones.size() - 1 ? "" : " R" + str.tostring(i + 1))
+            zoneLabels.push(drawZoneLabel(z, resCol, nm + "  " + zoneRangeTxt(z) + (mCapped and flatNow and z.bot == mCapBot ? "  ◄ caps target" : "") + (sameZone(z, strongRes) ? tpMark : ""), zoneLblOff, zLblSize, strong))
     for z in inZones
-        zoneBoxes.push(drawZone(z, color.gray))
+        bool strong = z.touches >= strongTouch
+        zoneBoxes.push(drawZone(z, color.gray, strong))
         if showZoneLbl
             bool isAnchor = not anchorShown and support >= z.bot and support <= z.top
             anchorShown := anchorShown or isAnchor
-            zoneLabels.push(drawZoneLabel(z, color.gray, "Price inside zone  " + zoneRangeTxt(z) + (isAnchor ? "  ◄ support used" : ""), zoneLblOff, zLblSize))
+            zoneLabels.push(drawZoneLabel(z, color.gray, (strong ? "Price inside strong zone  " : "Price inside zone  ") + zoneRangeTxt(z) + (isAnchor ? "  ◄ support used" : ""), zoneLblOff, zLblSize, strong))
     // Support used by filter 4 but not inside a drawn zone: label it on its own.
     if showZoneLbl and not anchorShown and not na(support)
         zoneLabels.push(label.new(bar_index + zoneLblOff, support, "Support used " + str.tostring(support, format.mintick) + "  (" + signStr((support / close - 1) * 100, "#.#") + "%, swing/pivot low)", style=label.style_label_left, color=color.new(color.orange, 25), textcolor=color.white, size=zLblSize))
@@ -662,7 +834,7 @@ passBg(bool ok)  => ok ? color.new(color.green, 20) : color.new(color.red, 20)
 
 tfOk = timeframe.isintraday and timeframe.multiplier == 15
 
-var table tbl = table.new(position.top_right, 3, 14, border_width=1, border_color=color.new(color.gray, 50))
+var table tbl = table.new(position.top_right, 3, 17, border_width=1, border_color=color.new(color.gray, 50))
 if showTable and barstate.islast
     hdrBg = color.new(color.gray, 20)
     table.cell(tbl, 0, 0, "Filter", text_color=color.white, bgcolor=hdrBg)
@@ -681,13 +853,26 @@ if showTable and barstate.islast
     if r1.size() > 0
         r1Txt := zoneRangeTxt(r1.first())
     f_row(tbl, 5, "Nearest zones", "S1 support " + s1Txt + "\nR1 resistance " + r1Txt, "INFO", hdrBg)
-    f_row(tbl, 6, "5a Stop & target", "SL -" + pctStr(riskFrac) + "  TP +" + pctStr(mTpPx / close - 1) + "  R:R " + str.tostring(mRR, "#.##") + " (min " + str.tostring(minRR, "#.#") + ")", passTxt(rrOk), passBg(rrOk))
-    f_row(tbl, 7, "5b Normal model", "P(TP) " + pctStr(mPU) + "  P(SL) " + pctStr(mPL) + "  P(time) " + pctStr(mPT) + "  ~" + str.tostring(mHold, "#.#") + "d", reqPwin ? passTxt(probOk) : "INFO", reqPwin ? passBg(probOk) : hdrBg)
-    f_row(tbl, 8, "5c Expected value", signStr(mEVR, "#.###") + "R (" + signStr(mEVPct * 100, "#.##") + "%) after costs & gaps, min " + str.tostring(minEV, "#.##") + "R", passTxt(evOk), passBg(evOk))
-    f_row(tbl, 9, "5d Gap risk (Poisson)", str.tostring(lamDn * 252, "#.#") + " large drops/yr -> " + pctStr(pJump) + " in " + str.tostring(holdDays) + "d (max " + pctStr(maxJumpP) + ")", passTxt(jumpOk), passBg(jumpOk))
-    f_row(tbl, 10, "Calibration (Bernoulli)", "TP hits " + str.tostring(calW, "#") + " vs " + str.tostring(calE, "#.#") + " expected (n=" + str.tostring(calN) + ", z " + signStr(calZ, "#.#") + ") -> x" + str.tostring(calib, "#.##"), "INFO", hdrBg)
-    f_row(tbl, 11, "LinReg trend", "slope " + str.tostring(regSlope / close * 100, "#.###") + "%/bar, R² " + str.tostring(regR2, "#.##") + ", t(adj) " + str.tostring(regTAdj, "#.#"), trendUp ? "▲ UP" : trendDn ? "▼ DOWN" : "FLAT", trendUp ? color.new(color.teal, 20) : trendDn ? color.new(color.maroon, 20) : hdrBg)
-    f_row(tbl, 12, "Chart timeframe", timeframe.period + (tfOk ? " (15m)" : " - switch chart to 15m"), tfOk ? "OK" : "CHECK", tfOk ? hdrBg : color.new(color.orange, 20))
-    table.cell(tbl, 0, 13, "SIGNAL", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 1, 13, strategy.position_size > 0 ? "In trade, day " + str.tostring(daysHeld) + " of " + str.tostring(holdDays) : "Flat", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 2, 13, preOk and modelOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=preOk and modelOk ? color.new(color.green, 20) : hdrBg)
+    string ssTxt = "none"
+    string srTxt = "none"
+    if not na(strongSup)
+        ssTxt := zoneRangeTxt(strongSup)
+    if not na(strongRes)
+        srTxt := zoneRangeTxt(strongRes)
+    f_row(tbl, 6, "Strong zones (>=" + str.tostring(strongTouch) + " touches)", "Strong support " + ssTxt + "\nStrong resistance " + srTxt, "INFO", hdrBg)
+    f_row(tbl, 7, "5a Stop & target", "SL -" + pctStr(riskFrac) + "  TP +" + pctStr(mTpPx / close - 1) + "  R:R " + str.tostring(mRR, "#.##") + " (min " + str.tostring(minRR, "#.#") + ")", passTxt(rrOk), passBg(rrOk))
+    string structTxt = na(structStopPx) ? "n/a (no strong support below)" : pxStr(structStopPx) + " (-" + pctStr((close - structStopPx) / close) + ")"
+    f_row(tbl, 8, "Stop: structure vs model", "Structure SL " + structTxt + "  |  model SL " + pxStr(modelStopPx) + " (-" + pctStr((close - modelStopPx) / close) + ")\nActive SL " + pxStr(stopPx) + (useStruct ? " (structure, min " + str.tostring(minStopSig, "#.#") + " sigma)" : " (model)"), useStruct ? "STRUCTURE" : "MODEL", hdrBg)
+    string tpzTxt = na(tpZonePx) ? "no strong resistance above" : "Strong R " + pxStr(tpZonePx) + " (+" + pctStr(tpZonePx / close - 1) + ") = " + str.tostring(tpZoneR, "#.##") + "R from " + (inPos ? "position" : "planned") + " entry/stop"
+    tpzTxt := tpzTxt + "\nTarget " + pxStr(mTpPx) + (mCapped ? " capped at " + (capStrong ? "strong " : "") + "resistance" : " (not capped)")
+    bool tpzRoom = not na(tpZoneR) and tpZoneR >= minRR
+    f_row(tbl, 9, "TP zone", tpzTxt, na(tpZoneR) ? "INFO" : tpzRoom ? "ROOM" : "TIGHT", na(tpZoneR) ? hdrBg : tpzRoom ? color.new(color.green, 20) : color.new(color.orange, 20))
+    f_row(tbl, 10, "5b Normal model", "P(TP) " + pctStr(mPU) + "  P(SL) " + pctStr(mPL) + "  P(time) " + pctStr(mPT) + "  ~" + str.tostring(mHold, "#.#") + "d", reqPwin ? passTxt(probOk) : "INFO", reqPwin ? passBg(probOk) : hdrBg)
+    f_row(tbl, 11, "5c Expected value", signStr(mEVR, "#.###") + "R (" + signStr(mEVPct * 100, "#.##") + "%) after costs & gaps, min " + str.tostring(minEV, "#.##") + "R", passTxt(evOk), passBg(evOk))
+    f_row(tbl, 12, "5d Gap risk (Poisson)", str.tostring(lamDn * 252, "#.#") + " large drops/yr -> " + pctStr(pJump) + " in " + str.tostring(holdDays) + "d (max " + pctStr(maxJumpP) + ")", passTxt(jumpOk), passBg(jumpOk))
+    f_row(tbl, 13, "Calibration (Bernoulli)", "TP hits " + str.tostring(calW, "#") + " vs " + str.tostring(calE, "#.#") + " expected (n=" + str.tostring(calN) + ", z " + signStr(calZ, "#.#") + ") -> x" + str.tostring(calib, "#.##"), "INFO", hdrBg)
+    f_row(tbl, 14, "LinReg trend", "slope " + str.tostring(regSlope / close * 100, "#.###") + "%/bar, R² " + str.tostring(regR2, "#.##") + ", t(adj) " + str.tostring(regTAdj, "#.#"), trendUp ? "▲ UP" : trendDn ? "▼ DOWN" : "FLAT", trendUp ? color.new(color.teal, 20) : trendDn ? color.new(color.maroon, 20) : hdrBg)
+    f_row(tbl, 15, "Chart timeframe", timeframe.period + (tfOk ? " (15m)" : " - switch chart to 15m"), tfOk ? "OK" : "CHECK", tfOk ? hdrBg : color.new(color.orange, 20))
+    table.cell(tbl, 0, 16, "SIGNAL", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 1, 16, strategy.position_size > 0 ? "In trade, day " + str.tostring(daysHeld) + " of " + str.tostring(holdDays) : "Flat", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 2, 16, preOk and modelOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=preOk and modelOk ? color.new(color.green, 20) : hdrBg)
