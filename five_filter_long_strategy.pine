@@ -124,6 +124,9 @@ grpMisc   = "Sizing & display"
 riskPct   = input.float(1.0, "Risk per trade (% of equity)", minval=0.01, maxval=100, step=0.25, group=grpMisc, tooltip="Shares = equity x risk% / (entry - stop), capped at 100% of equity, whole shares.")
 coolBars  = input.int(26, "Cooldown after an exit (bars)", minval=0, group=grpMisc)
 showTable = input.bool(true, "Show filter table", group=grpMisc)
+tblMode   = input.string("Compact", "Table style", options=["Compact", "Full"], group=grpMisc, tooltip="Compact: one short line per filter plus the signal. Full: every detail row.")
+tblSizeIn = input.string("tiny", "Table text size", options=["tiny", "small", "normal"], group=grpMisc)
+tblPosIn  = input.string("Top right", "Table position", options=["Top right", "Bottom right", "Top left", "Bottom left"], group=grpMisc)
 showNear  = input.bool(false, "Label bars where filters 1-4 pass but the model rejects", group=grpMisc)
 showPlan  = input.bool(true, "Show entry plan lines + live setup plan", group=grpMisc, tooltip="Short entry / SL / TP lines at every entry, and on the last bar a PLAN (or gray 'no trade: reason') whenever filters 1-4 pass.")
 planBars  = input.int(8, "Plan line length (bars)", minval=1, maxval=100, group=grpMisc)
@@ -824,22 +827,43 @@ if showReg and barstate.islast and not na(regInfl)
         piLower := polyline.new(dnPts, xloc=xloc.bar_index, line_color=color.new(regCol, 30), line_style=line.style_dashed)
 
 // Filter table (top-right). Shows the latest bar; final once that bar closes.
+tblTxt = tblSizeIn == "tiny" ? size.tiny : tblSizeIn == "normal" ? size.normal : size.small
+tblPos = tblPosIn == "Bottom right" ? position.bottom_right : tblPosIn == "Top left" ? position.top_left : tblPosIn == "Bottom left" ? position.bottom_left : position.top_right
+
 f_row(table t, int r, string name, string detail, string status, color statusBg) =>
-    table.cell(t, 0, r, name,   text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
-    table.cell(t, 1, r, detail, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
-    table.cell(t, 2, r, status, text_color=color.white, bgcolor=statusBg)
+    table.cell(t, 0, r, name,   text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15), text_size=tblTxt)
+    table.cell(t, 1, r, detail, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15), text_size=tblTxt)
+    table.cell(t, 2, r, status, text_color=color.white, bgcolor=statusBg, text_size=tblTxt)
+
+ck(bool b) => b ? "✔ " : "✘ "
+
+// Compact row: short name + one coloured status/value cell.
+c_row(table t, int r, string name, string val, color bg) =>
+    table.cell(t, 0, r, name, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 25), text_size=tblTxt)
+    table.cell(t, 1, r, val,  text_color=color.white, text_halign=text.align_left, bgcolor=bg, text_size=tblTxt)
 
 passTxt(bool ok) => ok ? "✔ PASS" : "✘ FAIL"
 passBg(bool ok)  => ok ? color.new(color.green, 20) : color.new(color.red, 20)
 
 tfOk = timeframe.isintraday and timeframe.multiplier == 15
 
-var table tbl = table.new(position.top_right, 3, 17, border_width=1, border_color=color.new(color.gray, 50))
-if showTable and barstate.islast
+var table tbl = table.new(tblPos, 3, 17, border_width=1, border_color=color.new(color.gray, 50))
+if showTable and barstate.islast and tblMode == "Compact"
+    cHdr = color.new(color.gray, 30)
+    c_row(tbl, 0, "1 Vol", ck(volOk) + str.tostring(volValue, "#.#") + "%", passBg(volOk))
+    c_row(tbl, 1, "2 Liq", ck(liqOk) + "RVOL " + str.tostring(rvol, "#.#") + "x", passBg(liqOk))
+    c_row(tbl, 2, "3 Mom", ck(momOk) + "drift " + signStr(muPost * 100, "#.##") + "%/d", passBg(momOk))
+    c_row(tbl, 3, "4 Sup", ck(supOk) + str.tostring(supDistSig, "#.#") + " sigma", passBg(supOk))
+    c_row(tbl, 4, "5 Model", ck(modelOk) + "R:R " + str.tostring(mRR, "#.#") + " | EV " + signStr(mEVR, "#.##") + "R", passBg(modelOk))
+    c_row(tbl, 5, "Plan", "SL " + str.tostring(stopPx, format.mintick) + " | TP " + str.tostring(mTpPx, format.mintick), cHdr)
+    c_row(tbl, 6, "Signal", strategy.position_size > 0 ? "In trade, day " + str.tostring(daysHeld) + "/" + str.tostring(holdDays) : preOk and modelOk ? "ENTER" : "SKIP", preOk and modelOk ? color.new(color.green, 20) : cHdr)
+    if not tfOk
+        c_row(tbl, 7, "Chart", timeframe.period + " -> use 15m", color.new(color.orange, 20))
+if showTable and barstate.islast and tblMode == "Full"
     hdrBg = color.new(color.gray, 20)
-    table.cell(tbl, 0, 0, "Filter", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 1, 0, "Value vs rule", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 2, 0, "Status", text_color=color.white, bgcolor=hdrBg)
+    table.cell(tbl, 0, 0, "Filter", text_color=color.white, bgcolor=hdrBg, text_size=tblTxt)
+    table.cell(tbl, 1, 0, "Value vs rule", text_color=color.white, bgcolor=hdrBg, text_size=tblTxt)
+    table.cell(tbl, 2, 0, "Status", text_color=color.white, bgcolor=hdrBg, text_size=tblTxt)
     f_row(tbl, 1, "1 Volatility", str.tostring(volValue, "#.##") + "% > " + str.tostring(volMin, "#.##") + "%", passTxt(volOk), passBg(volOk))
     f_row(tbl, 2, "2 Liquidity", "ADV " + str.tostring(advD, format.volume) + " >= " + str.tostring(minAdv, format.volume) + "; RVOL " + str.tostring(rvol, "#.##") + "x > " + str.tostring(rvolMin, "#.##") + "x", passTxt(liqOk), passBg(liqOk))
     f_row(tbl, 3, "3 Momentum", "EMA " + str.tostring(emaFastLen) + "/" + str.tostring(emaSlowLen) + (close > emaFast and emaFast > emaSlow ? " aligned" : " not aligned") + "; drift " + signStr(muPost * 100, "#.###") + "%/d (raw " + signStr(dMu * 100, "#.##") + ")", passTxt(momOk), passBg(momOk))
@@ -873,6 +897,6 @@ if showTable and barstate.islast
     f_row(tbl, 13, "Calibration (Bernoulli)", "TP hits " + str.tostring(calW, "#") + " vs " + str.tostring(calE, "#.#") + " expected (n=" + str.tostring(calN) + ", z " + signStr(calZ, "#.#") + ") -> x" + str.tostring(calib, "#.##"), "INFO", hdrBg)
     f_row(tbl, 14, "LinReg trend", "slope " + str.tostring(regSlope / close * 100, "#.###") + "%/bar, R² " + str.tostring(regR2, "#.##") + ", t(adj) " + str.tostring(regTAdj, "#.#"), trendUp ? "▲ UP" : trendDn ? "▼ DOWN" : "FLAT", trendUp ? color.new(color.teal, 20) : trendDn ? color.new(color.maroon, 20) : hdrBg)
     f_row(tbl, 15, "Chart timeframe", timeframe.period + (tfOk ? " (15m)" : " - switch chart to 15m"), tfOk ? "OK" : "CHECK", tfOk ? hdrBg : color.new(color.orange, 20))
-    table.cell(tbl, 0, 16, "SIGNAL", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 1, 16, strategy.position_size > 0 ? "In trade, day " + str.tostring(daysHeld) + " of " + str.tostring(holdDays) : "Flat", text_color=color.white, bgcolor=hdrBg)
-    table.cell(tbl, 2, 16, preOk and modelOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=preOk and modelOk ? color.new(color.green, 20) : hdrBg)
+    table.cell(tbl, 0, 16, "SIGNAL", text_color=color.white, bgcolor=hdrBg, text_size=tblTxt)
+    table.cell(tbl, 1, 16, strategy.position_size > 0 ? "In trade, day " + str.tostring(daysHeld) + " of " + str.tostring(holdDays) : "Flat", text_color=color.white, bgcolor=hdrBg, text_size=tblTxt)
+    table.cell(tbl, 2, 16, preOk and modelOk ? "ENTER" : "SKIP", text_color=color.white, bgcolor=preOk and modelOk ? color.new(color.green, 20) : hdrBg, text_size=tblTxt)
