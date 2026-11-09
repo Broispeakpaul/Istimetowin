@@ -82,6 +82,9 @@ recentK  = input.int(2, "Cold streak: halve risk if fewer winners than", minval=
 
 grpDisp  = "Display"
 showTbl  = input.bool(true, "Show status table", group=grpDisp)
+tblMode  = input.string("Compact", "Table style", options=["Compact", "Full"], group=grpDisp, tooltip="Compact: one short line per check plus the next order. Full: every detail row.")
+tblSzIn  = input.string("tiny", "Table text size", options=["tiny", "small", "normal"], group=grpDisp)
+tblPosIn = input.string("Top right", "Table position", options=["Top right", "Bottom right", "Top left", "Bottom left"], group=grpDisp)
 showLvl  = input.bool(true, "Show levels (LOD, ORH, prior-day high, daily EMAs)", group=grpDisp)
 showPlan = input.bool(true, "Show entry plan (buy-stop / stop / first-sale lines)", group=grpDisp, tooltip="Drawn when a buy-stop is placed for the next bar. Only the current plan is kept on the chart; fills keep their BUY label.")
 planLen  = input.int(8, "Plan line length (bars)", minval=1, maxval=100, group=grpDisp)
@@ -500,14 +503,32 @@ if barstate.islast
 // ---------------------------- STATUS TABLE ---------------------------
 okTxt(bool b) => b ? "✔" : "✘"
 okBg(bool b)  => b ? color.new(color.green, 25) : color.new(color.red, 25)
+tblTxt = tblSzIn == "tiny" ? size.tiny : tblSzIn == "normal" ? size.normal : size.small
+tblPos = tblPosIn == "Bottom right" ? position.bottom_right : tblPosIn == "Top left" ? position.top_left : tblPosIn == "Bottom left" ? position.bottom_left : position.top_right
 row(table t, int r, string a, string b, string c, color bg) =>
-    table.cell(t, 0, r, a, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
-    table.cell(t, 1, r, b, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15))
-    table.cell(t, 2, r, c, text_color=color.white, bgcolor=bg)
+    table.cell(t, 0, r, a, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15), text_size=tblTxt)
+    table.cell(t, 1, r, b, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 15), text_size=tblTxt)
+    table.cell(t, 2, r, c, text_color=color.white, bgcolor=bg, text_size=tblTxt)
+// Compact row: short name + one coloured value cell.
+crow(table t, int r, string a, string v, color bg) =>
+    table.cell(t, 0, r, a, text_color=color.white, text_halign=text.align_left, bgcolor=color.new(color.black, 25), text_size=tblTxt)
+    table.cell(t, 1, r, v, text_color=color.white, text_halign=text.align_left, bgcolor=bg, text_size=tblTxt)
 
 tfOk = timeframe.isintraday and timeframe.multiplier <= 15
-var table tbl = table.new(position.top_right, 3, 12, border_width=1, border_color=color.new(color.gray, 50))
-if showTbl and barstate.islast
+var table tbl = table.new(tblPos, 3, 12, border_width=1, border_color=color.new(color.gray, 50))
+if showTbl and barstate.islast and tblMode == "Compact"
+    cHdr = color.new(color.gray, 30)
+    bool trigOk = not na(trig) and stopPct <= maxStop
+    crow(tbl, 0, "Scan", okTxt(qualityOk) + " ADR " + str.tostring(dAdr, "#.#") + "%", okBg(qualityOk))
+    crow(tbl, 1, "Trend", okTxt(trendOk) + " " + str.tostring(dMom, "#") + "% / " + str.tostring(momLen) + "d", okBg(trendOk))
+    crow(tbl, 2, "Setup", setup == "" ? "-" : setup + (na(trig) ? "" : " @ " + str.tostring(trig, format.mintick)), setup == "" ? cHdr : color.new(color.green, 25))
+    crow(tbl, 3, "Stop", na(trig) ? "-" : okTxt(trigOk) + " " + str.tostring(stopPx, format.mintick) + " (" + str.tostring(stopPct, "#.#") + "%)", na(trig) ? cHdr : okBg(trigOk))
+    crow(tbl, 4, "Risk", str.tostring(riskNow, "#.##") + "%" + (riskMult < 1 ? " (cut)" : ""), riskMult < 1 ? color.new(color.orange, 20) : cHdr)
+    crow(tbl, 5, "Position", inPos ? str.tostring((close - entryPx) / riskInit, "#.#") + "R, " + (partialDone ? "trailing" : "to " + str.tostring(targetR, "#.#") + "R") : "flat", cHdr)
+    crow(tbl, 6, "Next bar", entryOk ? "BUY-STOP " + str.tostring(qty, "#") + " sh" : resBlock ? "BLOCKED (res)" : "WAIT", entryOk ? color.new(color.green, 20) : resBlock ? color.new(color.orange, 20) : cHdr)
+    if not tfOk
+        crow(tbl, 7, "Chart", timeframe.period + " -> use 1-15m", color.new(color.orange, 20))
+if showTbl and barstate.islast and tblMode == "Full"
     hdr = color.new(color.gray, 20)
     row(tbl, 0, "Scanner", "price " + str.tostring(close, format.mintick) + ", ADR " + str.tostring(dAdr, "#.#") + "%, $vol " + str.tostring(dDv / 1e6, "#.#") + "M", okTxt(qualityOk), okBg(qualityOk))
     row(tbl, 1, "Daily trend", str.tostring(dMom, "#") + "% in " + str.tostring(momLen) + "d, EMA10 " + (dE10 > dE20 ? ">" : "<") + " EMA20, " + (dPrevClose > dS50 ? "above" : "below") + " SMA50", okTxt(trendOk), okBg(trendOk))
